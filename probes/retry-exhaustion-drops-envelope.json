@@ -1,0 +1,16 @@
+{
+  "id": "retry-exhaustion-drops-envelope",
+  "severity": "medium",
+  "from_atom": "a-3d5b439d4d2b",
+  "message": "重试循环只记录异常、不保留服务端返回的可重试响应信封：耗尽后抛出的错误丢掉 error_code/message，线上只剩「重试失败」一句话",
+  "atom_hint": "重试|耗尽|error_code|信封|响应|异常|根因",
+  "added_any": [
+    "(?i)last_(error|exc|exception)\\s*=\\s*\\w+"
+  ],
+  "require_any": [
+    "(?i)(for\\s+attempt|attempts?\\s*[<>=+]|max_retries|retries|retry_max|backoff|退避|重试)"
+  ],
+  "unless_any": [
+    "(?i)(last_(result|response|resp|retryable|envelope))"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "model-score-to-int-without-finite-check",
+  "severity": "medium",
+  "from_atom": "a-83235fca0d63",
+  "message": "把模型分数直接 float→int(round()) 转成对外整数：模型偶发返回 NaN/inf 时会抛 ValueError，或把越界值截断成非法分数",
+  "atom_hint": "分数|score|int|round|NaN|inf|isfinite|截断",
+  "added_any": [
+    "(?i)(int\\(\\s*round\\(|int\\(\\s*float\\(|round\\(\\s*float\\()"
+  ],
+  "require_any": [
+    "(?i)(score|分数|rating|proba|confidence|llm|\\bmodel\\b)"
+  ],
+  "unless_any": [
+    "(?i)(isfinite|isnan|isinf|math\\.|np\\.nan|nan_to_num|min\\(\\s*100|max\\(\\s*0)"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "http-status-only-success",
+  "severity": "medium",
+  "message": "只看 HTTP 状态判定成功：网关/第三方常在 200 里返回业务错误码（如 X-Api-Status-Code 5xxxxxxx），会把失败响应当成功处理",
+  "atom_hint": "状态码|业务码|error_code|ok|成功判定|网关",
+  "added_any": [
+    "(?i)(status(_code)?\\s*==\\s*200|status(_code)?\\s*<\\s*400|resp(onse)?\\.ok\\b|raise_for_status\\(\\))"
+  ],
+  "require_any": [
+    "(?i)(requests|httpx|aiohttp|urllib|fetch\\(|\\bresp\\b|\\bresponse\\b|\\bapi\\b|endpoint)"
+  ],
+  "unless_any": [
+    "(?i)(api_code|biz_code|error_code|x-api-status|x_api_status|status_code\\s+in\\b|\\.json\\(\\)\\s*\\[|\\bcode\\s*[!=]=)"
+  ]
+}

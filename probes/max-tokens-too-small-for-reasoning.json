@@ -1,0 +1,16 @@
+{
+  "id": "max-tokens-too-small-for-reasoning",
+  "severity": "medium",
+  "from_atom": "a-8a1e4ce1d670",
+  "message": "思考模型的 max_tokens 里推理 token 也计数：只按最终输出长度设三位数时，推理阶段会先耗尽预算，返回空内容",
+  "atom_hint": "max_tokens|推理|预算|截断|finish_reason|思考",
+  "added_any": [
+    "(?i)max_tokens\\s*=\\s*\\d{1,3}\\b"
+  ],
+  "require_any": [
+    "(?i)(reasoning|thinking|思考|reasoner|deepseek-reasoner|o1|r1)"
+  ],
+  "unless_any": [
+    "(?i)(max_tokens\\s*=\\s*\\d{4,}|reasoning_budget|reasoning_effort)"
+  ]
+}

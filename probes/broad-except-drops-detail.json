@@ -1,0 +1,13 @@
+{
+  "id": "broad-except-drops-detail",
+  "severity": "medium",
+  "from_atom": "a-eed6cff8bc9f",
+  "message": "宽捕获（元组多异常/裸 except）把不同故障压成同一个错误码，且未记录异常类型或内容：线上日志只剩一个标签，分不清是校验失败、解析失败还是被过滤",
+  "atom_hint": "异常|except|吞掉|错误码|日志|诊断|分类",
+  "added_any": [
+    "(?i)(except\\s+(Exception|BaseException)\\s*(as\\s+\\w+)?\\s*:|except\\s*:|except\\s*\\([^)]*,[^)]*\\)\\s*(as\\s+\\w+)?\\s*:|^\\s*except\\s*\\(\\s*$)"
+  ],
+  "unless_any": [
+    "(?i)(logger\\.(exception|error|warning|critical)|logging\\.(exception|error|warning)|exc_info|traceback|type\\(exc\\)|type\\(e\\)|repr\\(exc\\))"
+  ]
+}

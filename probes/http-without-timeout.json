@@ -1,0 +1,15 @@
+{
+  "id": "http-without-timeout",
+  "severity": "high",
+  "message": "新增了外部调用，但同一文件未见超时/取消设置",
+  "atom_hint": "超时|timeout|deadline|csot|硬超时|超时预算|取消|cancel",
+  "added_any": [
+    "(?i)(HttpClient\\.newHttpClient|new RestTemplate|WebClient|feign\\.|axios\\.|fetch\\(|requests\\.(get|post|put|delete)|okhttp|HttpURLConnection)"
+  ],
+  "require_any": [
+    "(?i)(https?://|\\burls?\\b|\\bendpoint\\b|\\bhost\\b|\\bbase_url\\b|\\bheaders?\\b|\\bparams?\\b|\\bjson\\s*=|\\bbody\\b|\\bpath\\b|/v\\d+/)"
+  ],
+  "unless_any": [
+    "(?i)(timeout|deadline|cancel|Duration\\.of|connectTimeout|readTimeout|AbortController|signal\\s*:|超时|截止时间)"
+  ]
+}

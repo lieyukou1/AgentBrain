@@ -1,0 +1,15 @@
+{
+  "id": "agent-loop-without-budget",
+  "severity": "high",
+  "message": "新增了智能体/轮询主循环，但同一文件未见步数上限或明确退出条件（MAST FM-1.3 步骤重复 / FM-1.5 不识别终止条件）",
+  "atom_hint": "循环|步数|max_steps|终止|退出|上限|重试|agent|工具调用",
+  "added_any": [
+    "(?i)(while\\s+True\\s*:|while\\s+not\\s+\\w*(done|finished|is_complete)\\b|for\\s+step\\s+in\\s+range\\(|for\\s+_\\s+in\\s+itertools\\.count|\\bagent\\.run\\(|run_until_complete)"
+  ],
+  "require_any": [
+    "(?i)(agent|llm|model|completion|tool_calls?|function_call|messages|prompt|chat)"
+  ],
+  "unless_any": [
+    "(?i)(max_steps|max_iterations|max_rounds|max_turns|step_limit|\\bbudget\\b|deadline|timeout|\\bbreak\\b|最大步数|上限)"
+  ]
+}

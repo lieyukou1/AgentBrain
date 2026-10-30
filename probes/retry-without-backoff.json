@@ -1,0 +1,15 @@
+{
+  "id": "retry-without-backoff",
+  "severity": "medium",
+  "message": "新增了重试逻辑，但未见退避/间隔/抖动，可能放大故障",
+  "atom_hint": "退避|backoff|抖动|jitter|限流|并发槽|队列积压|重试频率|重试上限|maxAttempts|退避间隔",
+  "added_any": [
+    "(?i)(retry\\s*\\(|maxRetries|max_retries|maxAttempts|RetryTemplate|for\\s+attempt|attempts?\\s*[<>]=?\\s*\\d|重试次数|重试策略|重试逻辑|重试)"
+  ],
+  "require_any": [
+    "(?i)(http|requests|httpx|aiohttp|urllib|okhttp|RestTemplate|WebClient|client\\.|connect|socket|grpc|redis|mongo|sql|elasticsearch|\\bes\\.|kafka|mq|queue|数据库|网络|远程|上游|provider)"
+  ],
+  "unless_any": [
+    "(?i)(backoff|jitter|sleep\\(|delay|interval|退避|抖动|间隔)"
+  ]
+}

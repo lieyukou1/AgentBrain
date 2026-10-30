@@ -1,0 +1,15 @@
+{
+  "id": "write-without-idempotency",
+  "severity": "high",
+  "message": "新增了写操作，但未见幂等键/唯一约束/去重保护",
+  "atom_hint": "幂等|idempot|指纹|去重|唯一|outbox|重复投递|重放|duplicate",
+  "added_any": [
+    "(?i)(INSERT\\s+INTO|UPDATE\\s+\\w+\\s+SET|DELETE\\s+FROM|executeUpdate|\\.save\\(|\\.insert\\(|upsert|add\\(.*DEDUP)"
+  ],
+  "require_any": [
+    "(?i)(\\bdb\\b|database|repository|repo\\.|dao|mapper|collection|conn\\b|cursor|entity|table|mongo|mysql|postgres|sqlite|jdbc|jpa|hibernate|prisma|sequelize|drizzle|\\borm\\b|redis|elasticsearch)"
+  ],
+  "unless_any": [
+    "(?i)(idempot|unique|ON\\s+CONFLICT|request_id|dedup|幂等|唯一索引|去重|状态机|status\\s*==)"
+  ]
+}

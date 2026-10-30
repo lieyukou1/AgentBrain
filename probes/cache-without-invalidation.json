@@ -1,0 +1,15 @@
+{
+  "id": "cache-without-invalidation",
+  "severity": "medium",
+  "message": "新增了缓存，但未见失效/过期/淘汰路径",
+  "atom_hint": "缓存|cache|ttl|过期|失效|陈旧|stale|索引|一致性",
+  "added_any": [
+    "(?i)(@Cacheable|CacheManager|new Cache|缓存|memcache|redisTemplate|TTLCache|lru_cache)"
+  ],
+  "require_any": [
+    "(?i)(redis|memcache|caffeine|ehcache|\\bguava\\b|lru_cache|ttlcache|cachetools|cachemanager|@cacheable|cache\\[|cache\\.(get|set|put|delete|pop))"
+  ],
+  "unless_any": [
+    "(?i)(invalidat|evict|expire|ttl|TTL|失效|过期|删除缓存|eviction)"
+  ]
+}

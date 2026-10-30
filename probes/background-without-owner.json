@@ -1,0 +1,15 @@
+{
+  "id": "background-without-owner",
+  "severity": "medium",
+  "message": "新增了后台任务/线程，但未见停止/归属/生命周期语义",
+  "atom_hint": "租约|lease|心跳|续租|后台|调度|tick|线程|并发|锁|信号量|生命周期",
+  "added_any": [
+    "(?i)(new\\s+Thread|ExecutorService|ThreadPoolExecutor|ScheduledExecutor|@Scheduled|setInterval|asyncio\\.create_task|go\\s+func)"
+  ],
+  "require_any": [
+    "(?i)(application|server|serving|router|route|handler|middleware|scheduler|\\bworkers?\\b|service|controller|\\bloop\\b|lifespan|startup|daemon|listen|\\bserve\\b)"
+  ],
+  "unless_any": [
+    "(?i)(shutdown|stop\\(|close\\(|dispose|cancel|daemon|awaitTermination|停止|关闭|销毁|生命周期)"
+  ]
+}

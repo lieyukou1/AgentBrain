@@ -1,0 +1,16 @@
+{
+  "id": "update-count-as-outcome",
+  "severity": "high",
+  "from_atom": "a-35ab753961b9",
+  "message": "用更新命中行数（modified/nModified/affected_rows）判定操作成败：字段值未变时是 no-op（matched=1/modified=0），会把成功续租或重复写入误判为失败",
+  "atom_hint": "更新|续租|matched_count|modified|租约|幂等|影响行数",
+  "added_any": [
+    "(?i)(modified_count|modifiedCount|nModified|rows_affected|affected_rows)"
+  ],
+  "require_any": [
+    "(?i)(==\\s*0|!=\\s*1|<\\s*1|if\\s+not\\s+\\w*(count|affected|modified)|update|续租|renew|lease|idempot|幂等|写入)"
+  ],
+  "unless_any": [
+    "(?i)(matched_count|matchedCount|\\breplace_one\\b)"
+  ]
+}

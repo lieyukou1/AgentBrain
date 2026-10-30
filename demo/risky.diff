@@ -1,0 +1,7 @@
+﻿--- a/src/notify.py
++++ b/src/notify.py
+@@ -0,0 +1,4 @@
++import requests, sqlite3
++def notify(order):
++    requests.post('https://hook.example.com', json={"id": order.id})
++    sqlite3.connect('db').execute("INSERT INTO sent(id) VALUES (?)", (order.id,))

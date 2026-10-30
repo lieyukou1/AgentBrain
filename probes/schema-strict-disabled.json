@@ -1,0 +1,15 @@
+{
+  "id": "schema-strict-disabled",
+  "severity": "medium",
+  "message": "结构化输出关掉了 strict（strict=False）：provider 不强制校验时模型会回显输入或给出不符 schema 的字段，下游只看到静默缺失",
+  "atom_hint": "strict|json_schema|结构化|tool_calls|schema|校验",
+  "added_any": [
+    "(?i)(strict\\s*=\\s*False|\"strict\"\\s*:\\s*false|schemas?\\s*=\\s*None)"
+  ],
+  "require_any": [
+    "(?i)(tool|function|json_schema|structured|response_format|pydantic|BaseModel|schema)"
+  ],
+  "unless_any": [
+    "(?i)(model_validate|parse_obj|jsonschema|isinstance|validate\\()"
+  ]
+}

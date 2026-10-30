@@ -1,0 +1,24 @@
+# 运行时数据与日志：内含真实项目源码摘录、diff 与检索记录，只留本地，禁止入库
+data/
+logs/
+demo/data/
+secrets/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# demo/repo 自带 .git（早期演示挖矿用的临时仓库），不做子模块、也不入库
+demo/repo/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

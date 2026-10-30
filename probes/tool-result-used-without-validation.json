@@ -1,0 +1,15 @@
+{
+  "id": "tool-result-used-without-validation",
+  "severity": "high",
+  "message": "新增了直接消费工具/模型返回值的代码，但同一文件未见校验（MAST FM-3.2 未验证 / FM-3.3 验证方式不对；参数幻觉与假成功都从这类代码漏进来）",
+  "atom_hint": "校验|验证|schema|参数|返回值|工具调用|空值|幻觉",
+  "added_any": [
+    "(?i)(\\bjson\\.loads\\(|\\bJSON\\.parse\\(|\\bresp(onse)?\\.json\\(\\)|\\btool_calls?\\b|\\bfunction_call\\b)"
+  ],
+  "require_any": [
+    "(?i)(tool|function_call|tool_call|llm|model|completion|agent)"
+  ],
+  "unless_any": [
+    "(?i)(try\\s*:|except\\b|isinstance|validate|schema|BaseModel|pydantic|if\\s+not\\s+|raise\\s+|assert\\s+|throw\\s+)"
+  ]
+}

@@ -1,0 +1,12 @@
+﻿{
+  "id": "concurrency-without-sync",
+  "severity": "high",
+  "message": "新增了并发执行路径，但未见锁/信号量/原子性保护",
+  "atom_hint": "并发|协程|线程|锁|信号量|atomic|lease|租约|心跳|后台任务",
+  "added_any": [
+    "(?i)(new\\s+Thread\\s*\\(|ThreadPoolExecutor|Executors\\.|asyncio\\.create_task|go\\s+func|@Async|CompletableFuture\\.(runAsync|supplyAsync)|ScheduledExecutor|setInterval\\()"
+  ],
+  "unless_any": [
+    "(?i)(synchronized|ReentrantLock|\\bLock\\(|Semaphore|Mutex|atomic|AtomicInteger|AtomicReference|Queue\\(|with\\s+lock|加锁|互斥|信号量)"
+  ]
+}

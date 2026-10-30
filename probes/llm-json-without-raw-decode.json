@@ -1,0 +1,16 @@
+{
+  "id": "llm-json-without-raw-decode",
+  "severity": "high",
+  "from_atom": "a-4e85ced05313",
+  "message": "对模型自由文本直接 json.loads 整段：模型在 JSON 后追加解释、或包在代码块里时会抛 JSONDecodeError，应改用 raw_decode 或抽取首尾对象",
+  "atom_hint": "JSON|解析|raw_decode|尾随|代码块|json.loads|模型输出",
+  "added_any": [
+    "(?i)(json\\.loads\\(|JSON\\.parse\\(|resp(onse)?\\.json\\(\\))"
+  ],
+  "require_any": [
+    "(?i)(completion|choices\\[|tool_calls?|function_call|\\bllm\\b|\\bmodel\\b|chat\\.|\\bprompt\\b|assistant)"
+  ],
+  "unless_any": [
+    "(?i)(raw_decode|JSONDecoder|json_repair|extract_json|strip_code_fence|```)"
+  ]
+}
