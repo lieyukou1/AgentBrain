@@ -38,6 +38,7 @@ python -m brain search "回调 幂等 重复扣款"
 python -m brain search "租约" --repo E:\work\my-service   # 多项目库按仓库收窄
 git diff | python -m brain check
 python -m brain replay            # 回放：探针能否认出自己来源的坏代码
+python -m brain eval              # 检索回归：真实查询 + 人工标注的期望条目
 python -m brain funnel            # 四层漏斗：知识 → 加工 → 使用 → 反馈
 ```
 
@@ -80,6 +81,8 @@ tests/       单元测试（python -m unittest discover -s tests -q）
 ## 已知边界
 
 - 检索是关键词 AND + 中文 2-gram 覆盖度，不是向量检索；同义改写召回有限。
+- 检索默认只返回「接近最佳命中」的 3 条（MCP）／5 条（CLI），不凑满额；宁缺毋滥，
+  零命中就是库内没有。要看完整证据链用 `explain`。
 - 只有 git 信号一条自动准入路径，静态导入的 GitHub 项目不会自己长出经验。
 - 回放只能验证「规则与证据自洽」，不能验证「这条经验在真实任务里有用」。
 - 文档抽取在 API 参考类文档上产出偏项目事实，优先指向运维手册 / 事故复盘 / 设计权衡类文档。

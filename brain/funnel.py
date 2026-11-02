@@ -76,6 +76,25 @@ def usage(days: int = 7, today: date | None = None) -> dict:
     checked, check_hit = outcome_of("check_diff", "findings")
     # 只有这两类调用的结果才谈得上"命中"；stats/record_atom 不参与命中率
     judgeable = sum(1 for c in calls if c.get("tool") in ("search", "check_diff"))
+
+    # 命中强度与分层：判断"检索变差"还是"库变杂"只能看 top_score 的时间序列，
+    # 光有命中率看不出返回的是不是勉强及格的条目。
+    graded = [c for c in calls if c.get("tool") == "search"
+              and isinstance(c.get("result"), dict) and "top_score" in c["result"]]
+    top_scores = sorted(float(c["result"].get("top_score") or 0) for c in graded)
+    full = sum(1 for c in graded
+               if int(c["result"].get("asked") or 0) > 0
+               and int(c["result"].get("hits") or 0) >= int(c["result"]["asked"]))
+    tiers: Counter = Counter()
+    for c in graded:
+        for name, n in (c["result"].get("tiers") or {}).items():
+            tiers[str(name)] += int(n)
+
+    def pick(values: list[float], q: float) -> float | None:
+        if not values:
+            return None
+        return round(values[min(len(values) - 1, int(len(values) * q))], 2)
+
     return {
         "window_days": days,
         "calls": len(calls),
@@ -84,6 +103,11 @@ def usage(days: int = 7, today: date | None = None) -> dict:
         "by_tool": dict(by_tool),
         "search_calls": searched,
         "search_hit_rate": round(search_hit / searched, 3) if searched else None,
+        "search_graded": len(graded),
+        "search_top_score_p50": pick(top_scores, 0.5),
+        "search_top_score_p90": pick(top_scores, 0.9),
+        "search_full_rate": round(full / len(graded), 3) if graded else None,
+        "search_tiers": dict(tiers),
         "check_calls": checked,
         "check_hit_rate": round(check_hit / checked, 3) if checked else None,
         "unjudged": judgeable - searched - checked,

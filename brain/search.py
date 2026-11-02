@@ -19,6 +19,25 @@ STATUS_BONUS = {"accepted": 1.5}
 # 边按证据强度取前几条，避免同一文件上的经验把 linked 撑成一长串
 LINKED_LIMIT = 5
 MAX_TOKENS = 10
+# 评分口径的版本号：权重一改，历史 top_score 就不可比，日志里必须带上它
+SCORE_VERSION = 1
+
+# 相对门槛：只给「接近最佳命中」的条目，宁缺毋滥。
+# 0.65 / 1 是在 eval/queries.json 上试出来的拐点：recall@3 保持 1.0、
+# 标注为相关的条目保留 85%，同时挡掉跨话题噪声；再往上调只会切掉真相关的条目。
+# 不设绝对分数下限：分数随查询词数伸缩（单词语查询天然只有 5-7 分），
+# 固定阈值会把合法结果一并挡掉，而它想拦的"勉强沾边"用覆盖度门槛更准。
+SCORE_FLOOR_RATIO = 0.65
+COVERAGE_SLACK = 1
+
+
+def tier_for(matched: str) -> str:
+    """证据距离分层（只描述"离当前上下文多远"，不参与排序）。
+
+    L0 同文件/同提交锚点命中；L1 同仓库；L2 跨仓库或来源未知。
+    分层是为了让调用方知道该不该把这条当作本项目的约定，而不是当成同一份代码的证据。
+    """
+    return {"same_file": "L0", "same_repo": "L1"}.get(matched, "L2")
 
 
 def tokenize(query: str) -> list[str]:
@@ -87,17 +106,21 @@ def _norm_repo(value: str) -> str:
 
 
 def search_atoms(conn, query: str, limit: int = 10, fallback: bool = True,
-                 repo: str | None = None) -> list[dict]:
+                 repo: str | None = None, expand: bool = False) -> list[dict]:
     """fallback=True 时，无命中会退化为"按置信度取前 N 条"；探针关联必须用 fallback=False，
     否则会把不相关的经验硬塞给用户。
 
     repo 非空时只在该仓库内检索：多项目库里同一个词（如「幂等」）会同时命中几个项目，
     不区分仓库的话，最有用的那条会被别的项目的条目挤掉。
 
+    expand=False 时不带一跳邻居：每次检索都塞 linked 会让返回体翻倍，
+    而绝大多数调用只看得上前三条的 claim；要看邻居走 explain。
+
     过滤与排序都在内存里做：词数很少、表也不大，一条 SQL 拼 OR 反而既慢又容易漏。
     """
     tokens = tokenize(query)
     target = _norm_repo(repo) if repo else ""
+    tier = tier_for("same_repo" if target else "")
     rows: list = []
     if tokens:
         need = min_hits(len(tokens))
@@ -107,17 +130,29 @@ def search_atoms(conn, query: str, limit: int = 10, fallback: bool = True,
                 continue
             value, covered = score(row, tokens)
             if covered >= need:
-                scored.append((value, row))
+                scored.append((value, covered, row))
         # 同分再按置信度、id 排，保证结果稳定可复现
-        scored.sort(key=lambda pair: (-pair[0], -float(pair[1]["confidence"]), pair[1]["id"]))
-        rows = [row for _, row in scored[:int(limit)]]
+        scored.sort(key=lambda x: (-x[0], -float(x[2]["confidence"]), x[2]["id"]))
+        if scored:
+            top_value, best_covered = scored[0][0], scored[0][1]
+            # 相对门槛挡「勉强及格」，覆盖度门槛挡「只中一两个词就跟进来」的跨话题条目
+            floor = top_value * SCORE_FLOOR_RATIO
+            rows = [(value, row) for value, covered, row in scored
+                    if value >= floor and covered >= best_covered - COVERAGE_SLACK][:int(limit)]
     if not rows and fallback:
         pool = [r for r in conn.execute(
             "SELECT * FROM atoms WHERE status!='retired' ORDER BY confidence DESC")]
         if target:
             pool = [r for r in pool if _norm_repo(r["repo"]) == target]
-        rows = pool[:int(limit)]
-    return [to_dict(conn, r, expand=True) for r in rows]
+        rows = [(0.0, r) for r in pool[:int(limit)]]
+    out = []
+    for value, row in rows:
+        item = to_dict(conn, row, expand=expand)
+        # score 是本次查询内的相对强度，跨查询不可比；tier 描述证据距离
+        item["score"] = round(float(value), 2)
+        item["tier"] = tier
+        out.append(item)
+    return out
 
 
 def _like(text: str) -> str:
@@ -189,7 +224,10 @@ def related(conn, path: str, limit: int = 2, hint: str | None = None) -> list[di
         if hint and not re.search(hint, " ".join(
                 str(row[k] or "") for k in ("claim", "mechanism", "conditions", "counter")), re.I):
             continue
-        out.append(to_dict(conn, row, expand=False))
+        item = to_dict(conn, row, expand=False)
+        item["score"] = score(atom_id)
+        item["tier"] = tier_for("same_file" if atom_id in same_file else "same_repo")
+        out.append(item)
         if len(out) >= limit:
             break
     return out

@@ -153,6 +153,9 @@ def related_by_hint(conn, probe: dict, limit: int = 2) -> list[dict]:
             continue
         item = search.to_dict(conn, row, expand=False)
         item["via"] = "hint"
+        # 跨文件、跨项目的话题命中，属于最低一级证据
+        item["tier"] = search.tier_for("")
+        item["score"] = 0
         out.append(item)
         if len(out) >= limit:
             break

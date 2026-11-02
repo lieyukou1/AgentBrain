@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "score_version": 1,
+  "source": "logs/mcp-calls.jsonl 中 2026-10-30 的真实 search 查询（28 次调用，去重后 17 条）",
+  "labeling": "expect 只收能直接回答该问题的经验；相邻话题不算。候选来自当前检索 top5，存在选择偏差，后续应补入『检索完全没捞到』的漏检样本。",
+  "queries": [
+    {
+      "query": "ai-radar 事件时间 回声 降级 主线",
+      "expect": ["a-0f3e30b3994b", "a-ed312bdb9f19"],
+      "note": "跨项目查询：应命中 ai-radar 的回声判定与事件时间口径"
+    },
+    {
+      "query": "SQLite 跨线程 连接 重试 退避",
+      "expect": ["a-0df8843adc18"],
+      "note": "连接绑定线程；其余返回与本主题无关"
+    },
+    {
+      "query": "max_tokens 思考模型 空",
+      "expect": ["a-8a1e4ce1d670", "a-5cc5e02df08c"],
+      "note": "推理 token 计入预算；默认预算过小"
+    },
+    {
+      "query": "事件时间 材料时间",
+      "expect": ["a-ed312bdb9f19", "a-0f3e30b3994b"]
+    },
+    {
+      "query": "子进程 失败 诊断",
+      "expect": ["a-5348b855ef3e", "a-f5cf7bc7dd2d", "a-15d08a167366"],
+      "note": "失败事实被吞、诊断只在部分路径生成、EOF 与 close 竞态"
+    },
+    {
+      "query": "回看 候选 间隔 排序",
+      "expect": ["a-aef7867389a1", "a-9cc662bbba43"],
+      "note": "按 uid 排序导致只召回注册序；LIMIT N 缺时间窗"
+    },
+    {
+      "query": "时间窗 LIMIT 历史 去重",
+      "expect": ["a-9cc662bbba43"]
+    },
+    {
+      "query": "幂等 租约 续租 lease",
+      "expect": ["a-28d621e1d3bf", "a-7db35e6390c5", "a-35ab753961b9", "a-b994b2b48356"],
+      "note": "租约与幂等的四类失效路径"
+    },
+    {
+      "query": "撮合 tick 调度 并发",
+      "expect": ["a-7db35e6390c5", "a-78945e8bbee7", "a-914705209f59"]
+    },
+    {
+      "query": "深访 画像 进度",
+      "expect": ["a-30e43122e49a", "a-5b533721c9e0"],
+      "note": "进度阈值驱动可用性；metadata 携带的是旧状态"
+    },
+    {
+      "query": "推荐 召回 排序",
+      "expect": ["a-aef7867389a1"],
+      "note": "只有 2 条命中，推荐链路的知识覆盖偏薄"
+    },
+    {
+      "query": "画像 版本 SUPERSEDED 可用",
+      "expect": ["a-e1d39ef791c6"],
+      "note": "第 3 名是无关条目（pip 锁版本），作为噪声基线"
+    },
+    {
+      "query": "冷却 场景 state_revision 覆盖",
+      "expect": ["a-755bb8f61676", "a-2d3dbb971ebc"],
+      "note": "冷却写入不递增 state_revision 导致覆盖"
+    },
+    {
+      "query": "对侧 忽略 暂停 ignore_paused",
+      "expect": [],
+      "note": "库内确实没有该产品规则，返回任何条目都算误报"
+    },
+    {
+      "query": "补全 租约 owner 覆盖",
+      "expect": ["a-28d621e1d3bf"]
+    },
+    {
+      "query": "安全提示 频控 豁免",
+      "expect": [],
+      "note": "库内确实没有，返回任何条目都算误报"
+    },
+    {
+      "query": "语音 图片 非文本 场景判定",
+      "expect": [],
+      "note": "疑似召回失败：当前两条都不对题，暂按负例计；补到相关经验后应改为正例"
+    }
+  ]
+}
