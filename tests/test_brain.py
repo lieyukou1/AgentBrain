@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from brain import (  # noqa: E402
-    db, enrich, funnel, gitutil, ingest, link, mine, probes, refine, replay, search, verify,
+    brief, db, enrich, funnel, gitutil, ingest, link, mine, probes, redact, refine, replay,
+    rules, search, verify,
 )
 
 
@@ -382,6 +383,52 @@ class IngestTests(BrainTestBase):
         again = ingest.record(self.conn, payload)
         self.assertTrue(again.get("duplicate"))
 
+    def test_feedback_signal_tiers_and_auto_retire(self):
+        aid = db.add_atom(self.conn, {"claim": "回调失败后必须退避重试", "confidence": 0.5})
+        self.assertAlmostEqual(
+            ingest.feedback(self.conn, aid, "used")["confidence"], 0.55, places=2)
+        self.assertAlmostEqual(
+            ingest.feedback(self.conn, aid, "not-used")["confidence"], 0.50, places=2)
+        self.assertAlmostEqual(
+            ingest.feedback(self.conn, aid, "failed")["confidence"], 0.25, places=2)
+        down = ingest.feedback(self.conn, aid, "failed")
+        self.assertAlmostEqual(down["confidence"], 0.0, places=2)
+        self.assertEqual(down["status"], "retired")
+        bad = ingest.feedback(self.conn, aid, "bogus")
+        self.assertEqual(bad["reason"], "bad_outcome")
+
+    def test_supersede_retires_old_but_keeps_history(self):
+        repo = self._repo()
+        old = ingest.record(self.conn, {
+            "claim": "回调失败后应无限重试直到成功", "path": "a.py", "repo": str(repo)})
+        new = ingest.record(self.conn, {
+            "claim": "回调失败后必须退避重试并设上限，否则会拖垮下游",
+            "path": "a.py",
+            "repo": str(repo),
+            "supersedes": old["atom_id"],
+        })
+        self.assertNotIn("error", new)
+        self.assertEqual(new["superseded"]["superseded_by"], new["atom_id"])
+        old_row = db.get_atom(self.conn, old["atom_id"])
+        self.assertEqual(old_row["status"], "retired")
+        self.assertEqual(old_row["superseded_by"], new["atom_id"])
+        # 被取代的条目不能再出现在检索里，但 explain 仍能顺着链找到
+        hits = search.search_atoms(self.conn, "回调 失败 重试", fallback=False)
+        self.assertEqual([h["id"] for h in hits], [new["atom_id"]])
+        self.assertEqual(list(self.conn.execute(
+            "SELECT outcome FROM outcomes WHERE atom_id=?", (old["atom_id"],)))[0]["outcome"],
+            "superseded")
+
+    def test_supersede_rejects_missing_old_without_writing(self):
+        before = self.conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
+        result = ingest.record(self.conn, {
+            "claim": "新结论不能凭空取代一个不存在的条目",
+            "path": "a.py",
+            "supersedes": "a-doesnotexist",
+        })
+        self.assertEqual(result["reason"], "missing_old")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0], before)
+
     def test_feedback_shares_vocabulary_and_updates_confidence(self):
         aid = db.add_atom(self.conn, {"claim": "回调在无幂等键时会重复扣款", "confidence": 0.5})
         bad = ingest.feedback(self.conn, aid, "invalidated")
@@ -394,7 +441,174 @@ class IngestTests(BrainTestBase):
         self.assertAlmostEqual(down["confidence"], 0.45, places=2)
 
 
-@unittest.skipIf(shutil.which("git") is None, "git 不可用")
+class RedactTests(BrainTestBase):
+    """写入前脱敏：只拦高置信密钥，不误伤正常技术文本。"""
+
+    def test_known_patterns_are_redacted(self):
+        samples = {
+            "openai": "sk-abcdefghijklmnopqrstuvwxyz012345",
+            "github": "ghp_abcdefghijklmnopqrstuvwxyz012345",
+            "aws": "AKIAABCDEFGHIJKLMNOP",
+            "google": "AIza" + "a" * 35,
+            "slack": "xoxb-1234567890-abcdefghij",
+            "stripe": "sk_live_abcdefghijklmnop",
+            "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5NXgL0n3I9PlFUP0THsR8U",
+        }
+        for kind, secret in samples.items():
+            cleaned, hits = redact.clean_text(f"凭据是 {secret}")
+            self.assertTrue(hits, kind)
+            self.assertNotIn(secret, cleaned)
+
+    def test_private_key_block_is_redacted(self):
+        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"
+        cleaned, hits = redact.clean_text(text)
+        self.assertIn("private_key", hits)
+        self.assertNotIn("MIIEow", cleaned)
+
+    def test_credential_keeps_key_name(self):
+        cleaned, hits = redact.clean_text("api_key=abcdefghijklmnop1234")
+        self.assertIn("credential", hits)
+        self.assertIn("api_key=", cleaned)
+        self.assertNotIn("abcdefghijklmnop1234", cleaned)
+
+    def test_normal_technical_text_is_untouched(self):
+        for text in ("contain: layout", "sk-learn 用于分类", "token 过期后重试",
+                     "password 字段需要校验", "timeout=30"):
+            self.assertEqual(redact.clean_text(text)[1], [], text)
+
+    def test_ingest_redacts_claim_and_drops_secret_excerpt(self):
+        secret = "sk-abcdefghijklmnopqrstuvwxyz012345"
+        result = ingest.record(self.conn, {
+            "claim": f"配置里写死 {secret} 会把密钥带进日志",
+            "path": "a.py",
+            "excerpt": f"TOKEN={secret}",
+        })
+        self.assertNotIn("error", result)
+        self.assertIn("claim", result["redacted"])
+        self.assertIn("excerpt", result["redacted"])
+        row = db.get_atom(self.conn, result["atom_id"])
+        self.assertNotIn(secret, row["claim"])
+        anchor = [a for a in db.anchors_of(self.conn, result["atom_id"]) if a["kind"] == "file"][0]
+        self.assertEqual(anchor["excerpt"], "")
+
+
+class DeadEndTests(BrainTestBase):
+    """死路不是知识：不进 accepted 统计，只在检索与 check 时提醒别再试。"""
+
+    def test_add_dedupes_and_redacts(self):
+        secret = "sk-abcdefghijklmnopqrstuvwxyz012345"
+        first = db.add_dead_end(self.conn, "r", "a.py", f"给回调加无限重试 {secret}",
+                                "下游被打爆", "隔离 fixture")
+        self.assertIsInstance(first["id"], int)
+        again = db.add_dead_end(self.conn, "r", "a.py", f"给回调加无限重试 {secret}",
+                                "下游被打爆", "隔离 fixture")
+        self.assertTrue(again.get("duplicate"))
+        row = db.dead_ends_for(self.conn, path="a.py")[0]
+        self.assertNotIn(secret, row["tried"])
+        self.assertEqual(row["what_worked"], "隔离 fixture")
+
+    def test_search_returns_dead_ends_even_when_no_atom_matches(self):
+        db.add_dead_end(self.conn, "r", "src/pay.py", "给支付回调加无限重试",
+                        "把下游打爆", "加退避并设上限")
+        self.assertEqual(search.search_atoms(self.conn, "回调 重试", fallback=False), [])
+        hits = search.dead_ends(self.conn, "回调 重试")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("无限重试", hits[0]["tried"])
+
+    def test_check_diff_lists_dead_ends_and_blocks_at_three(self):
+        for i in range(3):
+            db.add_dead_end(self.conn, "r", "src/pay.py", f"方案 {i}", "失败原因", "最终方案")
+        diff = ("--- a/src/pay.py\n+++ b/src/pay.py\n@@ -0,0 +1,2 @@\n"
+                "+def pay():\n+    return client.post(url)\n")
+        result = probes.run_check(self.conn, diff)
+        block = result["dead_ends"][0]
+        self.assertEqual(block["path"], "src/pay.py")
+        self.assertEqual(block["count"], 3)
+        self.assertEqual(block["severity"], "block")
+        self.assertEqual(len(block["items"]), 3)
+
+    def test_mcp_records_dead_end_and_search_returns_it(self):
+        from brain import mcp
+        self.conn.execute("INSERT OR IGNORE INTO sources(path,added_at) VALUES(?,?)",
+                          ("E:/proj-a", db.now()))
+        self.conn.commit()
+        resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": {"name": "record_dead_end",
+                                                 "arguments": {"tried": "加长超时",
+                                                               "why_failed": "只是掩盖问题",
+                                                               "path": "a.py"}}})
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertIsInstance(payload["id"], int)
+        resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                      "params": {"name": "search",
+                                                 "arguments": {"query": "超时"}}})
+        found = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(found["results"], [])
+        self.assertEqual(len(found["dead_ends"]), 1)
+
+
+class BriefTests(BrainTestBase):
+    """brief 是索引不是答案：硬上限，超了就截断并说明。"""
+
+    def test_brief_is_bounded_and_says_when_truncated(self):
+        for i in range(30):
+            db.add_atom(self.conn, {"claim": f"第 {i} 条经验：" + "很长的结论" * 20,
+                                    "status": "accepted", "confidence": 0.5})
+        result = brief.build(self.conn, budget=300)
+        self.assertLessEqual(result["chars"], 300)
+        self.assertTrue(result["truncated"])
+        self.assertIn("brief 上限", result["text"])
+
+    def test_brief_includes_pending_recent_and_dead_ends(self):
+        db.add_atom(self.conn, {"claim": "已采纳的结论", "status": "accepted", "confidence": 0.9})
+        db.add_atom(self.conn, {"claim": "还没验证的候选", "status": "candidate"})
+        db.add_dead_end(self.conn, "r", "a.py", "加无限重试", "把下游打爆", "退避")
+        result = brief.build(self.conn)
+        self.assertIn("已采纳的结论", result["text"])
+        self.assertIn("还没验证的候选", result["text"])
+        self.assertIn("加无限重试", result["text"])
+        self.assertEqual(result["counts"]["dead_ends"], 1)
+
+    def test_repo_filter_keeps_other_projects_out(self):
+        db.add_atom(self.conn, {"claim": "甲项目经验", "status": "accepted", "repo": "E:/a"})
+        db.add_atom(self.conn, {"claim": "乙项目经验", "status": "accepted", "repo": "E:/b"})
+        text = brief.build(self.conn, repo="E:/a")["text"]
+        self.assertIn("甲项目经验", text)
+        self.assertNotIn("乙项目经验", text)
+
+
+class RulesTests(BrainTestBase):
+    """AGENTS.md 的托管段落只替换块内内容，块外一个字不动。"""
+
+    def test_append_preserves_existing_content_and_is_idempotent(self):
+        original = "# Repo\n\n自有规则：不要动我。\n"
+        updated, state = rules.apply(original)
+        self.assertEqual(state, "appended")
+        self.assertTrue(updated.startswith(original.rstrip("\n")))
+        self.assertIn("agentbrain-rules: 2", updated)
+        again, state2 = rules.apply(updated)
+        self.assertEqual(state2, "current")
+        self.assertEqual(again, updated)
+        self.assertEqual(again.count("## 经验库"), 1)
+
+    def test_outdated_block_is_replaced_without_touching_surroundings(self):
+        old = ("head\n<!-- agentbrain-rules: 1 -->\n## 旧规则\n<!-- /agentbrain-rules -->\ntail\n")
+        updated, state = rules.apply(old)
+        self.assertEqual(state, "outdated")
+        self.assertIn("head", updated)
+        self.assertIn("tail", updated)
+        self.assertNotIn("旧规则", updated)
+        self.assertEqual(rules.version_of(updated), rules.RULES_VERSION)
+
+    def test_apply_to_reports_without_writing_by_default(self):
+        repo = Path(self.tmp.name) / "docs-repo"
+        repo.mkdir()
+        result = rules.apply_to(str(repo))
+        self.assertEqual(result["state"], "appended")
+        self.assertFalse(result["written"])
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+
 class GuardOnlyTests(BrainTestBase):
     """方案 A：guard-only 只是线索，不是知识。"""
 
@@ -737,7 +951,11 @@ class McpTests(BrainTestBase):
 
     def test_search_without_hit_returns_empty_not_fallback(self):
         db.add_atom(self.conn, {"claim": "租约续租必须按 matched_count 判定", "confidence": 0.9})
-        self.assertEqual(self._call("search", {"query": "zzzqqq"})["results"], [])
+        payload = self._call("search", {"query": "zzzqqq"})
+        self.assertEqual(payload["results"], [])
+        # 空结果必须说清楚是"库里没有"，并给出可执行的下一步，不能只是留白
+        self.assertIn("record_atom", payload["guidance"])
+        self.assertIn("record_dead_end", payload["guidance"])
 
     def test_tool_call_is_logged(self):
         self._call("stats", {})
@@ -764,6 +982,30 @@ class McpTests(BrainTestBase):
         row = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(row["args"]["diff_text"], "<500 chars>")
 
+    def test_tool_exception_returns_error_and_keeps_session_alive(self):
+        from brain import mcp
+        with mock.patch.object(mcp, "_dispatch", side_effect=RuntimeError("boom")):
+            resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                          "params": {"name": "search", "arguments": {}}})
+        self.assertTrue(resp["result"]["isError"])
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertIn("RuntimeError", payload["error"])
+        # 下一次调用仍然可用：会话没有被一条坏工具拖死
+        self.assertIn("atoms", self._call("stats", {}))
+
+    def test_tool_stdout_never_leaks_into_protocol(self):
+        from brain import mcp
+        def noisy(conn, name, args):
+            print("debug output")
+            return {"ok": True}
+        captured = io.StringIO()
+        with mock.patch.object(mcp, "_dispatch", side_effect=noisy):
+            with contextlib.redirect_stdout(captured):
+                resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                              "params": {"name": "search", "arguments": {}}})
+        self.assertEqual(captured.getvalue(), "")
+        self.assertEqual(json.loads(resp["result"]["content"][0]["text"]), {"ok": True})
+
     def test_search_hit_count_is_logged_for_funnel(self):
         """字符数看不出有没有命中，命中率只能靠这个计数字段。"""
         db.add_atom(self.conn, {"claim": "租约续期判定"})
@@ -772,6 +1014,9 @@ class McpTests(BrainTestBase):
         row = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(row["result"]["hits"], 1)
         self.assertGreater(row["result"]["top_score"], 0)
+        # token 账本：字符 / 字节 / 估算 token 都要落，后两者才能反映真实成本
+        self.assertGreater(row["result_tokens"], 0)
+        self.assertGreaterEqual(row["result_bytes"], row["result_chars"])
 
     def test_stats_carries_usage_block(self):
         payload = self._call("stats", {})
@@ -780,6 +1025,19 @@ class McpTests(BrainTestBase):
 
 
 class DbTests(BrainTestBase):
+    def test_stats_reports_freshness_distribution(self):
+        ok = db.add_atom(self.conn, {"claim": "证据完好"})
+        db.add_anchor(self.conn, ok, "file", path="a.py")
+        missing = db.add_atom(self.conn, {"claim": "证据全失效"})
+        db.add_anchor(self.conn, missing, "file", path="gone.py")
+        db.add_atom(self.conn, {"claim": "从没校验过"})
+        self.conn.execute("UPDATE anchors SET resolved=1 WHERE atom_id=?", (ok,))
+        self.conn.execute("UPDATE anchors SET resolved=0 WHERE atom_id=?", (missing,))
+        self.conn.commit()
+        stats = db.stats(self.conn)
+        self.assertEqual(stats["freshness"], {"ok": 1, "partial": 0, "unverified": 1, "missing": 1})
+        self.assertIn("dead_ends", stats)
+
     def test_apply_enrichment_never_downgrades_confidence(self):
         aid = db.add_atom(self.conn, {"claim": "旧陈述", "confidence": 0.9})
         db.apply_enrichment(self.conn, aid, {"claim": "新陈述", "mechanism": "m", "counter": "c"})
@@ -835,6 +1093,20 @@ class DbTests(BrainTestBase):
         reopened = db.connect(Path(self.tmp.name) / "data" / "brain.db")
         self.addCleanup(reopened.close)
         self.assertEqual(db.get_atom(reopened, aid)["status"], "accepted")
+
+    def test_revoke_outcome_rolls_back_confidence_and_is_idempotent(self):
+        aid = db.add_atom(self.conn, {"claim": "回调在无幂等键时会重复扣款", "confidence": 0.5})
+        db.record_outcome(self.conn, aid, "validated", "本会话实测")
+        self.assertAlmostEqual(db.get_atom(self.conn, aid)["confidence"], 0.65, places=2)
+        oid = self.conn.execute(
+            "SELECT id FROM outcomes WHERE atom_id=? ORDER BY id DESC LIMIT 1", (aid,)
+        ).fetchone()["id"]
+        first = db.revoke_outcome(self.conn, oid)
+        self.assertTrue(first["revoked"])
+        self.assertAlmostEqual(first["confidence"], 0.5, places=2)
+        again = db.revoke_outcome(self.conn, oid)
+        self.assertAlmostEqual(again["confidence"], 0.5, places=2)
+        self.assertEqual(db.revoke_outcome(self.conn, 99999)["reason"], "missing")
 
 
 @unittest.skipIf(shutil.which("git") is None, "git 不可用")
@@ -988,6 +1260,78 @@ class SearchTests(BrainTestBase):
         self.assertGreater(loose[0]["score"], 0)
         same_repo = search.search_atoms(self.conn, "租约", fallback=False, repo=r"E:\proj-a")
         self.assertEqual(same_repo[0]["tier"], "L1")
+
+    def test_missing_anchor_is_excluded_from_search_and_fallback(self):
+        """锚点全失效 = 证据已经查不到，不能继续占返回位。"""
+        dead = db.add_atom(self.conn, {"claim": "租约过期后旧实例仍会写入", "confidence": 0.9})
+        db.add_anchor(self.conn, dead, "file", path="ghost.py")
+        self.conn.execute("UPDATE anchors SET resolved=0 WHERE atom_id=?", (dead,))
+        self.conn.commit()
+        self.assertEqual(search.search_atoms(self.conn, "租约", fallback=False), [])
+        self.assertEqual(search.search_atoms(self.conn, "", fallback=True), [])
+
+    def test_freshness_prefers_verified_and_penalizes_partial(self):
+        good = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8})
+        db.add_anchor(self.conn, good, "file", path="lease.py")
+        self.conn.execute("UPDATE anchors SET resolved=1 WHERE atom_id=?", (good,))
+        part = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8})
+        db.add_anchor(self.conn, part, "file", path="lease.py")
+        db.add_anchor(self.conn, part, "file", path="gone.py")
+        self.conn.execute("UPDATE anchors SET resolved=1 WHERE atom_id=? AND path='lease.py'", (part,))
+        self.conn.execute("UPDATE anchors SET resolved=0 WHERE atom_id=? AND path='gone.py'", (part,))
+        self.conn.commit()
+        self.assertEqual(search.freshness_of(self.conn, good), "ok")
+        self.assertEqual(search.freshness_of(self.conn, part), "partial")
+        rows = search.search_atoms(self.conn, "租约 续租", fallback=False)
+        self.assertEqual([r["id"] for r in rows], [good, part])
+        self.assertLess(rows[1]["score"], rows[0]["score"])
+
+    def test_brief_index_omits_evidence_but_keeps_identity(self):
+        """首屏只给索引：正文与锚点靠 explain 取，返回体才不会翻几倍。"""
+        aid = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner",
+                                      "mechanism": "并发续租时两个实例都认为自己是持有者",
+                                      "confidence": 0.9})
+        db.add_anchor(self.conn, aid, "file", path="lease.py")
+        brief = search.search_atoms(self.conn, "租约", brief=True)[0]
+        self.assertEqual(brief["id"], aid)
+        self.assertNotIn("anchors", brief)
+        self.assertNotIn("mechanism", brief)
+        self.assertIn("freshness", brief)
+        full = search.search_atoms(self.conn, "租约")[0]
+        self.assertIn("anchors", full)
+
+    def test_freshness_filter_returns_only_requested_level(self):
+        """过滤是精确匹配：要 partial 就只给 partial，不能把 ok 混进来。"""
+        ok = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8})
+        db.add_anchor(self.conn, ok, "file", path="lease.py")
+        part = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8})
+        db.add_anchor(self.conn, part, "file", path="lease.py")
+        db.add_anchor(self.conn, part, "file", path="gone.py")
+        self.conn.execute("UPDATE anchors SET resolved=1 WHERE atom_id=?", (ok,))
+        self.conn.execute("UPDATE anchors SET resolved=1 WHERE atom_id=? AND path='lease.py'", (part,))
+        self.conn.execute("UPDATE anchors SET resolved=0 WHERE atom_id=? AND path='gone.py'", (part,))
+        self.conn.commit()
+        rows = search.search_atoms(self.conn, "租约 续租", fallback=False, freshness="partial")
+        self.assertEqual([r["id"] for r in rows], [part])
+        self.assertEqual(search.search_atoms(self.conn, "租约 续租", fallback=False,
+                                             freshness="ok")[0]["id"], ok)
+
+    def test_same_stack_breaks_tie(self):
+        """同栈只是排序偏好：两条同样命中时，同栈的排前面。"""
+        py = Path(self.tmp.name) / "proj-py"
+        java = Path(self.tmp.name) / "proj-java"
+        py.mkdir()
+        java.mkdir()
+        (py / "pyproject.toml").write_text("", encoding="utf-8")
+        (java / "pom.xml").write_text("", encoding="utf-8")
+        db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8,
+                                "repo": str(py)})
+        db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8,
+                                "repo": str(java)})
+        first = search.search_atoms(self.conn, "租约 续租", fallback=False, stack="python")
+        self.assertEqual(Path(first[0]["repo"]).name, "proj-py")
+        second = search.search_atoms(self.conn, "租约 续租", fallback=False, stack="java")
+        self.assertEqual(Path(second[0]["repo"]).name, "proj-java")
 
     def test_related_marks_same_file_as_l0(self):
         aid = db.add_atom(self.conn, {"claim": "租约续期用 modified_count 判定会误报"})
@@ -1389,8 +1733,58 @@ class FunnelTests(BrainTestBase):
     def test_report_covers_four_layers(self):
         db.add_atom(self.conn, {"claim": "条目", "status": "accepted"})
         report = funnel.report(self.conn, days=7)
-        self.assertEqual(set(report), {"knowledge", "processing", "usage", "feedback"})
+        self.assertEqual(set(report), {"knowledge", "processing", "usage", "feedback",
+                                       "probes", "probe_feedback"})
         self.assertEqual(report["knowledge"]["by_status"], {"accepted": 1})
+
+    def test_usage_reports_token_and_return_ledger(self):
+        """token 账本要能回答「每次检索平均花多少、返回几条」。"""
+        self._log(
+            {"ts": "2026-10-30T10:00:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result_tokens": 80, "result_bytes": 300, "result": {"hits": 1}},
+            {"ts": "2026-10-30T10:01:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result_tokens": 120, "result_bytes": 500, "result": {"hits": 3}},
+            {"ts": "2026-10-30T10:02:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result_tokens": 200, "result_bytes": 700, "result": {"hits": 2}},
+            # 旧日志没有 token 字段，不能当成 0 拉低均值
+            {"ts": "2026-10-30T10:03:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result": {"hits": 9}},
+        )
+        usage = funnel.usage(days=7, today=date(2026, 10, 30))
+        self.assertEqual(usage["search_tokens_p50"], 120)
+        self.assertEqual(usage["search_tokens_p90"], 200)
+        self.assertEqual(usage["search_bytes_p50"], 500)
+        self.assertEqual(usage["search_returned_avg"], 2.0)
+
+    def test_probe_false_positive_downgrades_to_clue(self):
+        """误报率过高的探针不再告警，但仍以 clue 留痕。"""
+        aid = db.add_atom(self.conn, {"claim": "超时经验", "confidence": 0.8})
+        for _ in range(3):
+            db.record_outcome(self.conn, aid, "probe_false_positive",
+                              "probe:demo-noisy")
+        path = Path(self.tmp.name) / "logs"
+        path.mkdir(exist_ok=True)
+        (path / "mcp-calls.jsonl").write_text("".join(
+            json.dumps({"ts": "2026-10-30T10:00:00+08:00", "tool": "check_diff",
+                        "ok": True, "ms": 1, "result": {"findings": 1,
+                                                        "probes": ["demo-noisy"]}}) + "\n"
+            for _ in range(3)), encoding="utf-8")
+        ratios = probes.probe_ratios(self.conn)
+        self.assertTrue(ratios["demo-noisy"]["downgrade"])
+
+        probe = {"id": "demo-noisy", "added_any": [r"requests\.get\("],
+                 "severity": "high", "message": "网络调用缺超时"}
+        diff = ("--- a/src/net.py\n+++ b/src/net.py\n@@ -0,0 +1,2 @@\n"
+                "+resp = requests.get(url)\n+return resp\n")
+        with mock.patch.object(probes, "load_probes", return_value=[probe]):
+            result = probes.run_check(self.conn, diff)
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["downgraded_hits"], 1)
+        self.assertIn("demo-noisy", result["downgraded"])
+        clues = list(self.conn.execute("SELECT token, path FROM clues"))
+        self.assertEqual([(c["token"], c["path"]) for c in clues],
+                         [("demo-noisy", "src/net.py")])
+        self.assertEqual(db.get_atom(self.conn, aid)["confidence"], 0.5)
 
     def test_usage_reports_top_score_full_rate_and_tiers(self):
         """判断"检索变差"还是"库变杂"要看 top_score 与满额率的走势，单看命中率不够。"""
@@ -1445,7 +1839,38 @@ class EvaluateTests(BrainTestBase):
         path = self._write([{"query": "租约", "expect": []}])
         result = evaluate.run(self.conn, path=path)
         self.assertEqual(result["false_positives"], 1)
+        self.assertEqual(result["abstention_accuracy"], 0.0)
         self.assertEqual(result["rows"][0]["got"], [aid])
+
+    def test_scope_isolation_and_stale_rejection(self):
+        from brain import evaluate
+        good = db.add_atom(self.conn, {"claim": "租约续租必须校验 owner",
+                                       "repo": r"E:\proj-a"})
+        db.add_atom(self.conn, {"claim": "租约续租必须校验 owner",
+                                "repo": r"E:\proj-b"})
+        dead = db.add_atom(self.conn, {"claim": "租约 幂等 旧结论", "repo": r"E:\proj-a"})
+        db.add_anchor(self.conn, dead, "file", path="ghost.py")
+        self.conn.execute("UPDATE anchors SET resolved=0 WHERE atom_id=?", (dead,))
+        self.conn.commit()
+        path = self._write([
+            {"query": "租约 续租", "expect": [good], "repo": r"E:\proj-a"},
+            {"query": "租约 幂等", "expect": [dead]},
+        ])
+        result = evaluate.run(self.conn, path=path)
+        self.assertEqual(result["scope_isolation"], 1.0)
+        self.assertEqual(result["rows"][0]["leaked"], 0)
+        self.assertEqual(result["stale_shown"], 0)
+        self.assertEqual(result["stale_rejection"], 1.0)
+        self.assertEqual(result["rows"][1]["got"], [])
+
+    def test_budget_and_latency_are_reported(self):
+        from brain import evaluate
+        aid = db.add_atom(self.conn, {"claim": "租约过期后旧实例仍会写入", "confidence": 0.9})
+        path = self._write([{"query": "租约", "expect": [aid]}])
+        result = evaluate.run(self.conn, path=path)
+        self.assertEqual(result["over_budget"], 0)
+        self.assertGreater(result["token_budget_bytes"], 0)
+        self.assertGreaterEqual(result["latency_p95_ms"], result["latency_p50_ms"])
 
 
 class CallLogTests(BrainTestBase):
@@ -1601,6 +2026,37 @@ class MineSignalTests(BrainTestBase):
         self.assertEqual(mine._claim_for("x", ["fix"], False)[0], "")
 
     @unittest.skipIf(shutil.which("git") is None, "git 不可用")
+    def test_noise_commits_are_filtered_before_signals(self):
+        self.assertTrue(mine.is_noise("fix typo in readme", ["README.md"]))
+        self.assertTrue(mine.is_noise("style: prettier", ["src/a.py"]))
+        self.assertTrue(mine.is_noise("chore(deps): bump axios from 1 to 2", ["package.json"]))
+        self.assertTrue(mine.is_noise("chore: update lock", ["pnpm-lock.yaml"]))
+        self.assertTrue(mine.is_noise("wip", ["src/a.py"]))
+        self.assertFalse(mine.is_noise("fix: retry without backoff", ["src/pay.py"]))
+        self.assertEqual(mine.commit_kind('Revert "feat: retry"'), "revert")
+        self.assertEqual(mine.commit_kind("hotfix: payment timeout"), "hotfix")
+        self.assertEqual(mine.commit_kind("refactor: split scheduler"), "refactor")
+
+    @unittest.skipIf(shutil.which("git") is None, "git 不可用")
+    def test_revert_becomes_dead_end_not_claim(self):
+        repo = Path(self.tmp.name) / "rev"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.py").write_text("v = 0\n", encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "init")
+        (repo / "a.py").write_text("v = 1\n", encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", 'Revert "feat: add retry"')
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, encoding="utf-8").stdout.strip()
+        mine.mine_repo(self.conn, str(repo), limit=10)
+        dead = db.dead_ends_for(self.conn, path="a.py")
+        self.assertTrue(any("Revert" in d["tried"] for d in dead))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE commit_sha=?", (sha,)).fetchone()[0], 0)
+
+    @unittest.skipIf(shutil.which("git") is None, "git 不可用")
     def test_churn_ignores_lock_docs_and_test_files(self):
         repo = Path(self.tmp.name) / "c2"
         repo.mkdir()
@@ -1636,6 +2092,67 @@ class MineSignalTests(BrainTestBase):
         claims = [r["claim"] for r in self.conn.execute(
             "SELECT claim FROM atoms WHERE derivation='churn'")]
         self.assertTrue(any("hot.py" in c for c in claims))
+
+
+class MinePrTests(BrainTestBase):
+    """只收「评论 + 后续提交改了同一文件」的配对，且不落评论全文与 token。"""
+
+    def _repo(self) -> Path:
+        repo = Path(self.tmp.name) / "pr-repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "remote", "add", "origin", "https://github.com/acme/demo.git")
+        return repo
+
+    def _fetch(self, url: str):
+        if url.endswith("/pulls?state=all&sort=updated&direction=desc&per_page=5"):
+            return [{"number": 7}]
+        if "/pulls/7/comments" in url:
+            return [
+                {"id": 1, "path": "src/a.py", "body": "这里应该加超时，否则会挂住",
+                 "created_at": "2026-01-01T00:00:00Z"},
+                {"id": 2, "path": "src/b.py", "body": "这段文档措辞可以再改改",
+                 "created_at": "2026-01-01T00:00:00Z"},
+            ]
+        if "/pulls/7/commits" in url:
+            return [{"sha": "abc123", "commit": {"author": {"date": "2026-01-02T00:00:00Z"}}}]
+        if url.endswith("/commits/abc123"):
+            return {"files": [{"filename": "src/a.py"}]}
+        raise AssertionError(f"unexpected url: {url}")
+
+    def test_only_pairs_whose_file_changed_afterwards(self):
+        from brain import mine_pr
+        repo = self._repo()
+        result = mine_pr.mine(self.conn, str(repo), token="t", fetch=self._fetch)
+        self.assertEqual(result["created"], 1)
+        pair = result["pairs"][0]
+        self.assertEqual(pair["path"], "src/a.py")
+        self.assertNotIn("b.py", json.dumps(result, ensure_ascii=False))
+        row = self.conn.execute(
+            "SELECT * FROM atoms WHERE derivation='pr-comment'").fetchone()
+        self.assertEqual(row["commit_sha"], "abc123")
+        self.assertIn("超时", row["claim"])
+        anchors = list(self.conn.execute(
+            "SELECT kind,path FROM anchors WHERE atom_id=?", (row["id"],)))
+        self.assertEqual({(a["kind"], a["path"]) for a in anchors},
+                         {("commit", ""), ("file", "src/a.py")})
+
+    def test_dry_run_reports_without_writing(self):
+        from brain import mine_pr
+        repo = self._repo()
+        result = mine_pr.mine(self.conn, str(repo), token="t", dry_run=True,
+                              fetch=self._fetch)
+        self.assertEqual(result["created"], 0)
+        self.assertTrue(result["pairs"][0]["dry_run"])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0], 0)
+
+    def test_requires_read_only_token_without_persisting_it(self):
+        from brain import mine_pr
+        repo = self._repo()
+        result = mine_pr.mine(self.conn, str(repo), token="")
+        self.assertIn("GITHUB_TOKEN", result["error"])
+        # 错误信息里不能带出鉴权头或 token 本身
+        self.assertNotIn("Bearer", json.dumps(result))
 
 
 class _Resp:
@@ -1840,6 +2357,128 @@ class ReplayTests(BrainTestBase):
             report = replay.replay_all(self.conn)
         self.assertEqual(report["total"], 1)
         self.assertEqual(report["by_status"], {"hit": 1})
+        self.assertEqual(report["hit_rate"], 1.0)
+        self.assertEqual(report["unrunnable"], 0)
+
+    def test_hit_rate_excludes_data_gaps_from_denominator(self):
+        """no_commit 是数据缺口，不是规则不自洽；算进分母会让旧库永远过不了门禁。"""
+        hit = {"probe": "p-hit", "atom": "a-1", "status": "hit"}
+        miss = {"probe": "p-miss", "atom": "a-2", "status": "miss", "blocked_by": "added_any"}
+        gap = {"probe": "p-gap", "atom": "a-3", "status": "no_commit"}
+        with mock.patch.object(replay, "replay_one", side_effect=[hit, miss, gap]):
+            with mock.patch.object(replay.probes, "load_probes", return_value=[
+                {"id": "p-hit", "from_atom": "a-1"},
+                {"id": "p-miss", "from_atom": "a-2"},
+                {"id": "p-gap", "from_atom": "a-3"},
+            ]):
+                report = replay.replay_all(self.conn)
+        self.assertEqual(report["hit_rate"], 0.5)
+        self.assertEqual(report["unrunnable"], 1)
+        self.assertEqual(report["misses"], ["p-miss"])
+
+    def test_record_snapshot_is_read_by_funnel(self):
+        """funnel 不该为了看指标再跑一遍 git：回放结果落快照，funnel 只读快照。"""
+        snapshot = replay.record({"total": 2, "by_status": {"hit": 2}, "blocked_by": {},
+                                  "hit_rate": 1.0, "unrunnable": 0, "misses": [],
+                                  "rows": [{"probe": "p"}]})
+        self.assertIn("ran_at", snapshot)
+        report = funnel.report(self.conn)
+        self.assertEqual(report["probes"]["hit_rate"], 1.0)
+        self.assertNotIn("rows", report["probes"])
+
+
+@unittest.skipIf(shutil.which("git") is None, "git 不可用")
+class HookTests(BrainTestBase):
+    """hook 只入队，不挖矿：提交路径上不能跑 git diff 与模型。"""
+
+    def _repo(self) -> tuple[Path, str]:
+        repo = Path(self.tmp.name) / "hooked"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "init")
+        (repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", 'Revert "feat: add handler"')
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, encoding="utf-8").stdout.strip()
+        return repo, sha
+
+    def _run(self, *argv: str) -> tuple[int, str]:
+        from brain import cli
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(list(argv))
+        return code, buf.getvalue()
+
+    def test_install_preserves_existing_hook_and_uninstall_restores_it(self):
+        from brain import hooks
+        repo, _ = self._repo()
+        hooks_dir = Path(repo) / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        custom = hooks_dir / "post-commit"
+        original = "#!/bin/sh\necho custom\n"
+        custom.write_text(original, encoding="utf-8")
+
+        result = hooks.install(str(repo))
+        self.assertEqual(result["installed"], ["post-commit", "post-merge"])
+        self.assertIn("# agentbrain-hook: 1", custom.read_text(encoding="utf-8"))
+        self.assertEqual((hooks_dir / "post-commit.pre-brain").read_text(encoding="utf-8"),
+                         original)
+        # 重装不能把备份覆盖成我们自己
+        hooks.install(str(repo))
+        self.assertEqual((hooks_dir / "post-commit.pre-brain").read_text(encoding="utf-8"),
+                         original)
+
+        hooks.uninstall(str(repo))
+        self.assertEqual(custom.read_text(encoding="utf-8"), original)
+        self.assertFalse((hooks_dir / "post-commit.pre-brain").exists())
+
+    def test_pre_commit_gate_is_opt_in(self):
+        """pre-commit 会阻塞提交，所以只有显式要求时才装。"""
+        from brain import hooks
+        repo, _ = self._repo()
+        hooks_dir = Path(repo) / ".git" / "hooks"
+        self.assertEqual(hooks.install(str(repo))["installed"],
+                         ["post-commit", "post-merge"])
+        self.assertFalse((hooks_dir / "pre-commit").exists())
+
+        result = hooks.install(str(repo), pre_commit=True)
+        self.assertIn("pre-commit", result["installed"])
+        script = (hooks_dir / "pre-commit").read_text(encoding="utf-8")
+        self.assertIn("--min-hit-rate", script)
+        self.assertIn("PYTHONPATH=", script)
+        hooks.uninstall(str(repo))
+        self.assertFalse((hooks_dir / "pre-commit").exists())
+
+    def test_queue_dedupes_and_consume_removes_processed(self):
+        from brain import hooks
+        path = hooks.queue_path()
+        path.write_text(
+            "2026-11-02T10:00:00Z\tpost-commit\tabc123\tE:/proj-a\n"
+            "2026-11-02T10:00:00Z\tpost-commit\tabc123\tE:/proj-a\n"
+            "bad line\n",
+            encoding="utf-8")
+        entries = hooks.read_queue()
+        self.assertEqual(len(entries), 1)
+        # 物理上的重复行一起清掉，避免下次再从同一提交挖一遍
+        self.assertEqual(hooks.consume(entries), 2)
+        self.assertEqual(hooks.read_queue(), [])
+
+    def test_mine_from_queue_processes_only_queued_commits(self):
+        from brain import hooks
+        repo, sha = self._repo()
+        hooks.queue_path().write_text(
+            f"2026-11-02T10:00:00Z\tpost-commit\t{sha}\t{repo.as_posix()}\n",
+            encoding="utf-8")
+        code, out = self._run("mine", "--from-queue")
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(result["consumed"], 1)
+        self.assertGreaterEqual(result["results"][0]["created"], 1)
+        self.assertEqual(hooks.read_queue(), [])
 
 
 class CliTests(BrainTestBase):
@@ -1854,6 +2493,19 @@ class CliTests(BrainTestBase):
         code, out = self._run("add-source", self.tmp.name)
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["sources"], [str(Path(self.tmp.name).resolve())])
+
+    def test_replay_gate_fails_when_hit_rate_below_threshold(self):
+        """回放门禁靠退出码表达：CI 与 pre-commit 都只看这个码。"""
+        import contextlib as _ctx
+        from brain import cli
+        low = {"total": 2, "by_status": {"hit": 1, "miss": 1}, "blocked_by": {},
+               "hit_rate": 0.5, "unrunnable": 0, "misses": ["p"], "rows": []}
+        with mock.patch.object(replay, "replay_all", return_value=low):
+            buf = io.StringIO()
+            with _ctx.redirect_stdout(buf):
+                code = cli.main(["replay", "--min-hit-rate", "0.9"])
+        self.assertEqual(code, 2)
+        self.assertIn("门禁未通过", buf.getvalue())
 
     def test_add_with_anchor_succeeds_and_without_anchor_fails(self):
         code, out = self._run("add", "--claim", "并发写入缺少唯一键会导致重复扣款",
@@ -2009,12 +2661,13 @@ class McpMoreTests(BrainTestBase):
                                       "params": {"name": name, "arguments": args}})
         return json.loads(resp["result"]["content"][0]["text"])
 
-    def test_tools_list_exposes_nine_tools(self):
+    def test_tools_list_exposes_eleven_tools(self):
         from brain import mcp
         resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in resp["result"]["tools"]}
-        self.assertEqual(names, {"search", "explain", "record_atom", "check_diff", "audit_diff",
-                                 "record_outcome", "review_atom", "review_pending", "stats"})
+        self.assertEqual(names, {"search", "explain", "record_atom", "record_dead_end",
+                                 "check_diff", "audit_diff", "record_outcome", "revoke_outcome",
+                                 "review_atom", "review_pending", "stats"})
 
     def test_initialize_carries_instructions(self):
         from brain import mcp
@@ -2085,12 +2738,15 @@ class McpMoreTests(BrainTestBase):
                                               "arguments": {"diff_text": "x", "record": False}}})
         self.assertFalse(run.call_args.kwargs["record"])
 
-    def test_tool_exception_is_logged_as_failure(self):
+    def test_tool_exception_is_returned_as_error_and_logged(self):
         from brain import mcp
         resp = mcp.handle(self.conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                       "params": {"name": "check_diff",
                                                  "arguments": {"diff_text": None}}})
-        self.assertEqual(resp["error"]["code"], -32603)
+        # 单条工具失败返回 isError，不把整个 JSON-RPC 调用打成协议错误
+        self.assertTrue(resp["result"]["isError"])
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertIn("check_diff", payload["tool"])
         row = json.loads((Path(self.tmp.name) / "logs" / "mcp-calls.jsonl")
                          .read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(row["tool"], "check_diff")

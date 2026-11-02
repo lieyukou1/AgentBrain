@@ -1,6 +1,7 @@
 """MCP stdio 服务：JSON-RPC 2.0，逐行消息，无第三方依赖。
 
-可用工具：search / explain / record_atom / check_diff / record_outcome / review_pending / stats
+可用工具：search / explain / record_atom / check_diff / audit_diff / record_outcome /
+revoke_outcome / review_atom / review_pending / stats。
 所有工具返回 text content（JSON 字符串），便于任何客户端展示。
 initialize 会返回 instructions（何时用哪个工具），工具描述也写成"何时用"口径，
 因为客户端往往只把工具名与描述露给模型，不读这段就等于没有入口。
@@ -8,6 +9,8 @@ initialize 会返回 instructions（何时用哪个工具），工具描述也�
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import time
@@ -42,7 +45,7 @@ TOOLS = [
             "何时用：动手修改不熟悉的代码前，或不确定某类问题是否踩过坑时，用 2-4 个关键词"
             "检索已沉淀经验。返回 claim、机制、触发条件、反例与证据锚点（commit/文件/片段）。"
             "默认只给 3 条、只给接近最佳命中的结果，零命中就是库内没有，不要用其它结果凑数，"
-            "也不要据此认为无风险。"
+            "也不要据此认为无风险。若同一主题下有「试过并失败」的死路，会放在 dead_ends 里一并返回。"
             "查「这段代码在做什么」不要用它，直接读代码。"
         ),
         "inputSchema": {
@@ -52,6 +55,11 @@ TOOLS = [
                 "limit": {"type": "integer", "default": 3},
                 "repo": {"type": "string",
                          "description": "可选：只在该仓库内检索，库里收录了多个项目时用它收窄"},
+                "freshness": {"type": "string", "enum": ["ok", "partial", "unverified"],
+                              "description": "可选：只看指定证据状态的条目"},
+                "stack": {"type": "string",
+                          "description": "可选：当前项目技术栈（python/node/java/go/rust/docker），"
+                                         "跨仓库检索时同栈条目优先，仅影响排序"}
             },
             "required": ["query"],
         },
@@ -89,8 +97,31 @@ TOOLS = [
                 "line_start": {"type": "integer"},
                 "line_end": {"type": "integer"},
                 "excerpt": {"type": "string", "description": "锚定行的原文片段，用于机检"},
+                "supersedes": {"type": "string",
+                               "description": "可选：被这条新结论取代的旧 atom id；旧条会退休但保留历史"},
             },
             "required": ["claim"],
+        },
+    },
+    {
+        "name": "record_dead_end",
+        "description": (
+            "何时用：一次修复尝试失败或只部分奏效时，把「试过什么、为什么不行、最后什么有效」"
+            "记下来。它不进 accepted 统计，只用于下次改同一文件前提醒不要再走这条路。"
+            "必须给 path；why_failed 与 what_worked 尽量写具体，否则下个会话无法判断。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tried": {"type": "string", "description": "试过的做法"},
+                "why_failed": {"type": "string", "description": "为什么没成"},
+                "what_worked": {"type": "string", "description": "最后有效的做法"},
+                "conditions": {"type": "string", "description": "在什么条件下"},
+                "path": {"type": "string", "description": "仓库内相对路径，必填"},
+                "commit": {"type": "string"},
+                "repo": {"type": "string", "description": "仓库绝对路径；省略则用第一个登记的源"},
+            },
+            "required": ["tried", "path"],
         },
     },
     {
@@ -109,18 +140,36 @@ TOOLS = [
     {
         "name": "record_outcome",
         "description": (
-            "何时用：某条经验在本次任务中确实帮你避开了问题（validated），或看了但没用上"
-            "（insufficient）时调用，它会调整该条置信度，长期把没用的条目压下去。"
-            "不要凭感觉批量刷，只记真实发生过的判定。"
+            "何时用：某条经验在本次任务中起了作用、或验证失败、或被证明是错的时调用。"
+            "validated=确实避免了问题；used=只提供了线索；not-used=看了没用上；"
+            "failed=按它做但失败了；corrected=结论本身被纠正。它会调整置信度，"
+            "长期把没用的条目压下去。不要凭感觉批量刷，只记真实发生过的判定。"
+            "探针误报用 probe_false_positive，note 写成 probe:<探针 id>，"
+            "误报率过高时 check_diff 会自动把该探针降级为线索。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "atom_id": {"type": "string"},
-                "outcome": {"type": "string", "enum": ["validated", "insufficient"]},
+                "outcome": {"type": "string", "enum": sorted(db.FEEDBACK_DELTAS)},
                 "note": {"type": "string"},
             },
             "required": ["atom_id", "outcome"],
+        },
+    },
+    {
+        "name": "revoke_outcome",
+        "description": (
+            "何时用：发现某次 validated / insufficient 记错了（把 A 的验证记到了 B 上、"
+            "或当时判断有误）时撤销它。事件保留为 revoked，置信度反向回滚；"
+            "不要用它修改结论本身——结论变了应该记一条新经验并 supersede。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "outcome_id": {"type": "integer", "description": "反馈事件 id（explain 可见）"},
+            },
+            "required": ["outcome_id"],
         },
     },
     {
@@ -193,21 +242,47 @@ TOOLS = [
 def _dispatch(conn, name: str, args: dict) -> dict:
     if name == "search":
         # fallback 必须关掉：无命中就该返回空，而不是拿最高置信度的条目凑数
-        return {"results": search.search_atoms(
-            conn, args.get("query", ""), int(args.get("limit", 3)),
-            fallback=False, repo=args.get("repo") or None)}
+        query = args.get("query", "")
+        results = search.search_atoms(
+            conn, query, int(args.get("limit", 3)),
+            fallback=False, repo=args.get("repo") or None, brief=True,
+            freshness=args.get("freshness") or None, stack=args.get("stack") or None)
+        dead = search.dead_ends(conn, query)
+        payload = {
+            "results": results,
+            "dead_ends": dead,
+            "next": "需要机制、反例与证据锚点时，用 explain <id> 取完整条目",
+        }
+        if not results and not dead:
+            # 空结果必须说清楚是"库里没有"，否则模型容易当成"没有风险"
+            payload["guidance"] = ("库内没有相关经验。若这次确实踩到可复现的坑，"
+                                   "用 record_atom 写入（需 commit 或 path 锚点）；"
+                                   "失败的尝试用 record_dead_end 记录。")
+        return payload
     if name == "explain":
         row = db.get_atom(conn, args.get("atom_id", ""))
         if row is None:
             return {"error": "atom 不存在"}
         return {
             **{k: row[k] for k in row.keys()},
+            "freshness": search.freshness_of(conn, row["id"]),
             "anchors": [dict(a) for a in db.anchors_of(conn, row["id"])],
             "edges": [dict(e) for e in conn.execute(
                 "SELECT rel,dst,weight FROM edges WHERE src=? ORDER BY weight DESC", (row["id"],))],
+            "outcomes": [dict(o) for o in conn.execute(
+                "SELECT id,outcome,note,revoked,created_at FROM outcomes WHERE atom_id=? ORDER BY id",
+                (row["id"],))],
+            "supersedes": [dict(r) for r in conn.execute(
+                "SELECT id,claim,status,updated_at FROM atoms WHERE superseded_by=? ORDER BY updated_at",
+                (row["id"],))],
         }
     if name == "record_atom":
         return ingest.record(conn, args)
+    if name == "record_dead_end":
+        repo = args.get("repo") or (db.stats(conn)["sources"] or [""])[0]
+        return db.add_dead_end(conn, repo, args.get("path", ""), args.get("tried", ""),
+                               args.get("why_failed", ""), args.get("what_worked", ""),
+                               args.get("conditions", ""), args.get("commit", ""))
     if name == "check_diff":
         return probes.run_check(conn, args.get("diff_text", ""))
     if name == "audit_diff":
@@ -216,6 +291,8 @@ def _dispatch(conn, name: str, args: dict) -> dict:
     if name == "record_outcome":
         return ingest.feedback(conn, args.get("atom_id", ""), args.get("outcome", ""),
                                args.get("note", ""))
+    if name == "revoke_outcome":
+        return db.revoke_outcome(conn, args.get("outcome_id", 0))
     if name == "review_atom":
         return ingest.review(conn, args.get("atom_id", ""), args.get("verdict", ""),
                              args.get("note", ""))
@@ -261,10 +338,15 @@ def _result_brief(name: str, payload, args: dict | None = None) -> dict:
             "top_score": max((float(i.get("score") or 0) for i in results), default=0.0),
             "score_version": search.SCORE_VERSION,
             "tiers": tiers,
+            "dead_ends": len(payload.get("dead_ends") or []),
         }
     if name == "check_diff":
-        return {"findings": len(payload.get("findings") or []),
-                "related": len(payload.get("related_atoms") or [])}
+        findings = payload.get("findings") or []
+        return {"findings": len(findings),
+                "dead_ends": len(payload.get("dead_ends") or []),
+                "related": len(payload.get("related_atoms") or []),
+                # 只记命中的探针 id（不落 diff），才能按探针聚合误报率
+                "probes": sorted({str(f.get("probe")) for f in findings})[:20]}
     if name == "audit_diff":
         results = payload.get("results") or []
         return {"candidates": payload.get("candidates", 0),
@@ -277,7 +359,7 @@ def _result_brief(name: str, payload, args: dict | None = None) -> dict:
     return {}
 
 
-def _log_call(name: str, args: dict, ok: bool, ms: int, result_chars: int,
+def _log_call(name: str, args: dict, ok: bool, ms: int, text: str,
               result: dict | None = None) -> None:
     """MCP 调用留痕；写日志失败不能影响工具调用本身。"""
     try:
@@ -287,12 +369,31 @@ def _log_call(name: str, args: dict, ok: bool, ms: int, result_chars: int,
             "ok": ok,
             "ms": ms,
             "args": _arg_brief(args),
-            "result_chars": result_chars,
+            # 字符数 / 字节数 / 估算 token 三者一起记：
+            # 中文的字符数与 token 数接近，英文差 4 倍，只看字符会低估英文返回体
+            "result_chars": len(text),
+            "result_bytes": len(text.encode("utf-8")),
+            "result_tokens": calllog.estimate_tokens(text),
             # 命中率只能从结构化的计数算出来，光有字符数看不出"这次到底有没有结果"
             "result": result or {},
         })
     except OSError:
         pass
+
+
+def _safe_dispatch(conn, name: str, args: dict) -> tuple[dict, bool]:
+    """工具级隔离：异常与 print 都不能逃进 JSON-RPC 通道。
+
+    MCP 的多路复用靠 stdout，任何工具内部的 print 都会撕坏协议；
+    单条工具抛异常也不该结束整个会话。所以这里同时做两件事：
+    把 stdout 临时收进内存，把异常转成模型可读的 error 文本。
+    """
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured):
+            return _dispatch(conn, name, args), True
+    except Exception as exc:  # 单次调用失败不能拖垮连接
+        return {"error": f"{type(exc).__name__}: {exc}", "tool": name}, False
 
 
 def handle(conn, msg: dict) -> dict | None:
@@ -311,17 +412,13 @@ def handle(conn, msg: dict) -> dict | None:
             name = params.get("name", "")
             args = params.get("arguments") or {}
             started = time.perf_counter()
-            try:
-                payload = _dispatch(conn, name, args)
-            except Exception as exc:
-                _log_call(name, args, False,
-                          int((time.perf_counter() - started) * 1000),
-                          len(f"{type(exc).__name__}: {exc}"))
-                raise
+            payload, ok = _safe_dispatch(conn, name, args)
             text = json.dumps(payload, ensure_ascii=False)
-            _log_call(name, args, True, int((time.perf_counter() - started) * 1000), len(text),
+            _log_call(name, args, ok, int((time.perf_counter() - started) * 1000), text,
                       _result_brief(name, payload, args))
             result = {"content": [{"type": "text", "text": text}]}
+            if not ok:
+                result["isError"] = True
         elif method == "ping":
             result = {}
         else:

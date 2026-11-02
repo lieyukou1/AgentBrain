@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 from . import (  # noqa: F401
-    audit, db, doc_ingest, enrich, evaluate, funnel, ingest, link, mine, probes, refine, replay,
-    search, verify,
+    audit, brief, db, doc_ingest, enrich, evaluate, funnel, hooks, ingest, link, mine,
+    mine_pr, probes, refine, replay, rules, search, verify,
 )
 
 
@@ -31,12 +31,45 @@ def cmd_add_source(conn, args) -> int:
 
 
 def cmd_mine(conn, args) -> int:
+    if args.from_queue:
+        entries = hooks.read_queue()
+        if not entries:
+            _out({"queued": 0, "results": [], "note": "队列为空；先 brain hook install"})
+            return 0
+        by_repo: dict[str, list[dict]] = {}
+        for entry in entries:
+            by_repo.setdefault(entry["repo"], []).append(entry)
+        results, done = [], []
+        for repo, items in by_repo.items():
+            result = mine.mine_repo(conn, repo, limit=args.limit,
+                                    shas=[i["sha"] for i in items])
+            results.append(result)
+            if "error" not in result:
+                done.extend(items)
+        _out({"queued": len(entries), "consumed": hooks.consume(done),
+              "results": results, "stats": db.stats(conn)})
+        return 0
     repos = [args.repo] if args.repo else db.stats(conn)["sources"]
     if not repos:
         _out({"error": "没有种子仓库，先运行：brain add-source <path>"})
         return 2
     results = [mine.mine_repo(conn, r, limit=args.limit, since=args.since) for r in repos]
     _out({"results": results, "stats": db.stats(conn)})
+    return 0
+
+
+def cmd_mine_pr(conn, args) -> int:
+    result = mine_pr.mine(conn, args.repo, limit=args.limit, dry_run=args.dry_run,
+                          token=args.token)
+    _out(result)
+    return 0 if "error" not in result else 2
+
+
+def cmd_hook(conn, args) -> int:
+    if args.uninstall:
+        _out(hooks.uninstall(args.repo))
+    else:
+        _out(hooks.install(args.repo, pre_commit=args.pre_commit))
     return 0
 
 
@@ -52,7 +85,46 @@ def cmd_add(conn, args) -> int:
         "line_start": args.line_start,
         "line_end": args.line_end,
         "excerpt": args.excerpt,
+        "supersedes": args.supersedes,
     })
+    _out(result)
+    return 0 if "error" not in result else 2
+
+
+def cmd_revoke(conn, args) -> int:
+    result = db.revoke_outcome(conn, args.outcome_id)
+    _out(result)
+    return 0 if "error" not in result else 2
+
+
+def cmd_dead_end(conn, args) -> int:
+    repo = args.repo
+    if not repo:
+        sources = db.stats(conn)["sources"]
+        repo = sources[0] if sources else ""
+    result = db.add_dead_end(conn, repo, args.path, args.tried, args.why,
+                             args.worked, args.conditions, args.commit)
+    _out(result)
+    return 0 if "error" not in result else 2
+
+
+def cmd_dead_ends(conn, args) -> int:
+    rows = db.dead_ends_for(conn, path=args.path, repo=args.repo, limit=args.limit)
+    _out({"count": len(rows), "items": [dict(r) for r in rows]})
+    return 0
+
+
+def cmd_brief(conn, args) -> int:
+    result = brief.build(conn, repo=args.repo, budget=args.budget)
+    if args.json:
+        _out(result)
+    else:
+        print(result["text"])
+    return 0
+
+
+def cmd_init_docs(conn, args) -> int:
+    result = rules.apply_to(args.repo, write=args.write)
     _out(result)
     return 0 if "error" not in result else 2
 
@@ -178,21 +250,32 @@ def cmd_outcome(conn, args) -> int:
 
 def cmd_search(conn, args) -> int:
     results = search.search_atoms(conn, args.query, limit=args.limit,
-                                  fallback=args.any, repo=args.repo)
+                                  fallback=args.any, repo=args.repo,
+                                  freshness=args.freshness, stack=args.stack)
+    dead = search.dead_ends(conn, args.query)
     if args.json:
-        _out(results)
+        _out({"results": results, "dead_ends": dead})
         return 0
-    if not results:
+    if not results and not dead:
         print("无命中。加 --any 可查看高置信条目（但那不是检索结果）。")
         return 0
     for r in results:
         print(f"[{r['id']}] conf={r['confidence']:.2f} score={r.get('score', 0)} "
-              f"{r.get('tier', '?')} {r['status']}  {_short(r['claim'], 140)}")
+              f"{r.get('tier', '?')} {r.get('freshness', '?')} {r['status']}  "
+              f"{_short(r['claim'], 140)}")
         for a in r["anchors"][:2]:
             print(f"   - {a['kind']} {a['path'] or a['commit']} {_short(a['excerpt'], 60)}")
         for e in r.get("linked", [])[:2]:
             via = f" via {'、'.join(e['via'][:2])}" if e.get("via") else ""
             print(f"   ↔ {e['rel']}({e['weight']:.0f}){via} [{e['id']}] {_short(e['claim'], 70)}")
+    if dead:
+        print("\n死路（试过并失败，不要再试）：")
+        for d in dead:
+            print(f"   [{d['path'] or '未标注文件'}] 试过：{_short(d['tried'], 90)}")
+            if d["why_failed"]:
+                print(f"      失败原因：{_short(d['why_failed'], 90)}")
+            if d["what_worked"]:
+                print(f"      有效做法：{_short(d['what_worked'], 90)}")
     return 0
 
 
@@ -203,11 +286,16 @@ def cmd_explain(conn, args) -> int:
         return 2
     _out({
         **{k: row[k] for k in row.keys()},
+        "freshness": search.freshness_of(conn, args.id),
         "anchors": [dict(a) for a in db.anchors_of(conn, args.id)],
         "edges": [dict(e) for e in conn.execute(
             "SELECT rel,dst,weight FROM edges WHERE src=? ORDER BY weight DESC", (args.id,))],
         "outcomes": [dict(o) for o in conn.execute(
-            "SELECT outcome,note,created_at FROM outcomes WHERE atom_id=? ORDER BY id", (args.id,))],
+            "SELECT id,outcome,note,revoked,created_at FROM outcomes WHERE atom_id=? ORDER BY id",
+            (args.id,))],
+        "supersedes": [dict(r) for r in conn.execute(
+            "SELECT id,claim,status,updated_at FROM atoms WHERE superseded_by=? ORDER BY updated_at",
+            (args.id,))],
     })
     return 0
 
@@ -229,6 +317,19 @@ def cmd_check(conn, args) -> int:
             print(f"  ← 相关经验 [{a['id']}] {_short(a['claim'], 100)}{tag}")
         if not f["atoms"]:
             print("  ← 库内暂无对应经验（该探针本身就是待沉淀的线索）")
+    if result.get("downgraded_hits"):
+        print(f"\n另有 {result['downgraded_hits']} 条命中来自已降级探针"
+              f"（{', '.join(sorted(result.get('downgraded', {})))}），只记线索、不告警。")
+    if result["dead_ends"]:
+        # C3：三段一起给，读者才能直接回答「试过什么、为什么不行、该怎么做」，
+        # 只写一句「试过不行」等于没记
+        print("\n这些文件上试过并失败的做法：")
+        for d in result["dead_ends"]:
+            print(f"\n[{d['severity']}] {d['path']}（累计 {d['count']} 次失败）")
+            for item in d["items"]:
+                print(f"  试过：{_short(item['tried'], 120)}")
+                print(f"  为什么不行：{_short(item['why_failed'], 120) or '未记录'}")
+                print(f"  有效做法：{_short(item['what_worked'], 120) or '未记录'}")
     if result["related_atoms"]:
         print("\n这些文件上的既有经验（可用于 record_outcome）：")
         for a in result["related_atoms"]:
@@ -348,26 +449,54 @@ def cmd_funnel(conn, args) -> int:
               f"top_score p50 {u['search_top_score_p50']}｜p90 {u['search_top_score_p90']}"
               f"｜满额返回 {u['search_full_rate']}"
               "｜分层 " + " ".join(f"{k}={v}" for k, v in sorted(u["search_tiers"].items())))
+    if u["search_tokens_p50"] is not None:
+        print(f"        检索成本：约 {u['search_tokens_p50']} token/次（p50）"
+              f"｜p90 {u['search_tokens_p90']}"
+              f"｜{u['search_bytes_p50']} 字节/次（p50）"
+              f"｜平均返回 {u['search_returned_avg']} 条")
     print(f"反馈层：outcome {f['outcomes']} 条，validated {f['validated']}"
-          f"（{f['validated_rate']}），其中机器批量判定 {f['auto_graded']} 条")
+          f"（{f['validated_rate']}），其中机器批量判定 {f['auto_graded']} 条"
+          f"，取代 {f['superseded']} 条")
     print(f"        audit 疑似命中 {f['audit_hits']} 次，覆盖 {f['audit_atoms']} 条经验")
     print(f"        真实使用反馈覆盖 {f['real_feedback_atoms']} 条经验；"
           f"accepted 里 {f['accepted_without_real_feedback']} 条只是格式合格")
+    pr = data.get("probes")
+    if pr:
+        print(f"探针层：{pr.get('total', 0)} 条带回放来源，命中率 {pr.get('hit_rate')}"
+              f"｜数据缺口 {pr.get('unrunnable', 0)}"
+              f"｜记录于 {pr.get('ran_at', '?')}")
+    else:
+        print("探针层：还没有回放记录（运行 python -m brain replay）")
+    pf = data.get("probe_feedback") or {}
+    if pf:
+        print("        命中/误报：" + "｜".join(
+            f"{pid} {info['hits']}/{info['false_positives']}"
+            + ("（已降级）" if info["downgrade"] else "")
+            for pid, info in sorted(pf.items())))
     return 0
 
 
 def cmd_replay(conn, args) -> int:
     result = replay.replay_all(conn, only_probe=args.probe)
+    snapshot = replay.record(result)
+    failed = (args.min_hit_rate is not None
+              and (result["hit_rate"] is None or result["hit_rate"] < args.min_hit_rate))
     if args.json:
-        _out(result)
-        return 0
+        _out({**result, "recorded_at": snapshot["ran_at"],
+              "gate": None if args.min_hit_rate is None
+              else {"min_hit_rate": args.min_hit_rate, "passed": not failed}})
+        return 2 if failed else 0
     if not result["total"]:
         print("没有带来源经验的探针（检查 probes/*.json 的 from_atom）。")
-        return 0
+        return 2 if failed else 0
     print(f"回放 {result['total']} 条探针："
           + "｜".join(f"{k} {v}" for k, v in sorted(result["by_status"].items())))
     if result["blocked_by"]:
         print("未命中原因：" + "｜".join(f"{k} {v}" for k, v in sorted(result["blocked_by"].items())))
+    if result["hit_rate"] is not None:
+        print(f"可回放命中率 {result['hit_rate']}（{result['by_status'].get('hit', 0)}/"
+              f"{result['by_status'].get('hit', 0) + result['by_status'].get('miss', 0)}）"
+              f"｜数据缺口 {result['unrunnable']} 条")
     print()
     labels = {"hit": "命中", "miss": "未命中", "no_source": "源经验缺失",
               "no_commit": "无提交锚点", "no_parent": "无父提交",
@@ -376,6 +505,10 @@ def cmd_replay(conn, args) -> int:
         status = labels.get(row["status"], row["status"])
         detail = row.get("blocked_by") or row.get("path") or row.get("commit", "")
         print(f"  {row['probe']:<42}{status:<8}{detail}")
+    if failed:
+        print(f"\n门禁未通过：命中率低于 {args.min_hit_rate}。"
+              "先修规则（blocked_by 指向卡住的门槛），或修数据缺口。")
+        return 2
     return 0
 
 
@@ -386,7 +519,12 @@ def cmd_eval(conn, args) -> int:
         return 0
     print(f"评测 {result['queries']} 条查询（有期望 {result['graded']}｜空期望 {result['negatives']}）")
     print(f"recall@1 {result['recall_at_1']}｜recall@3 {result['recall_at_3']}"
+          f"｜precision@3 {result['precision_at_3']}"
           f"｜有期望却零命中 {result['zero_hit']}｜空期望误报 {result['false_positives']}")
+    print(f"该空就空 {result['abstention_accuracy']}｜跨库隔离 {result['scope_isolation']}"
+          f"｜失效条目 {result['stale_shown']}"
+          f"｜超预算 {result['over_budget']}/{result['token_budget_bytes']}B"
+          f"｜延迟 p50 {result['latency_p50_ms']}ms / p95 {result['latency_p95_ms']}ms")
     for row in result["rows"]:
         mark = ("✓" if row["hit_at_3"] else "✗") if row["expected"] else \
                ("!" if row["false_positive"] else "✓")
@@ -433,7 +571,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo")
     s.add_argument("--limit", type=int, default=200)
     s.add_argument("--since")
+    s.add_argument("--from-queue", action="store_true",
+                   help="只处理 git hook 入队的提交，处理完清空队列")
     s.set_defaults(func=cmd_mine)
+
+    s = sub.add_parser("mine-pr", help="从 GitHub PR 评论挖候选（只读 API，需 GITHUB_TOKEN）")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--limit", type=int, default=mine_pr.DEFAULT_PRS,
+                   help="扫描最近更新的多少个 PR")
+    s.add_argument("--dry-run", action="store_true", help="只报告配对，不写库")
+    s.add_argument("--token", default=None,
+                   help="GitHub 只读 token；建议改用环境变量 GITHUB_TOKEN，避免留在 shell 历史里")
+    s.set_defaults(func=cmd_mine_pr)
+
+    s = sub.add_parser("hook", help="安装/卸载 git hook（轻量入队；可选提交前回放门禁）")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--pre-commit", action="store_true",
+                   help="同时安装 pre-commit：回放命中率低于 0.9 时拒绝提交")
+    s.add_argument("--uninstall", action="store_true")
+    s.set_defaults(func=cmd_hook)
 
     s = sub.add_parser("add", help="写入一条候选经验（必须带锚点）")
     s.add_argument("--claim", required=True)
@@ -446,7 +602,39 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--line-start", type=int, default=None)
     s.add_argument("--line-end", type=int, default=None)
     s.add_argument("--excerpt", default="")
+    s.add_argument("--supersedes", default="", help="用这条新结论取代的旧 atom id")
     s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("revoke", help="撤销一次误记的反馈（保留事件，回滚置信度）")
+    s.add_argument("outcome_id", type=int)
+    s.set_defaults(func=cmd_revoke)
+
+    s = sub.add_parser("dead-end", help="记一条「试过但失败」的死路")
+    s.add_argument("--tried", required=True, help="试过什么做法")
+    s.add_argument("--why", default="", help="为什么失败")
+    s.add_argument("--worked", default="", help="最后什么做法有效")
+    s.add_argument("--conditions", default="")
+    s.add_argument("--path", default="")
+    s.add_argument("--commit", default="")
+    s.add_argument("--repo", default="")
+    s.set_defaults(func=cmd_dead_end)
+
+    s = sub.add_parser("dead-ends", help="列出已记录的死路（可按文件/仓库过滤）")
+    s.add_argument("--path", default=None)
+    s.add_argument("--repo", default=None)
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(func=cmd_dead_ends)
+
+    s = sub.add_parser("brief", help="有界快照：会话启动时该看的一页")
+    s.add_argument("--repo", default=None)
+    s.add_argument("--budget", type=int, default=brief.BRIEF_CHARS)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_brief)
+
+    s = sub.add_parser("init-docs", help="检查/刷新 AGENTS.md 里的经验库使用约定")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--write", action="store_true", help="实际写入；不加只报告状态")
+    s.set_defaults(func=cmd_init_docs)
 
     s = sub.add_parser("prune", help="把早期误升格的条目退回（保留历史）")
     s.add_argument("--guard-only", action="store_true")
@@ -498,9 +686,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--note", default="")
     s.set_defaults(func=cmd_rate)
 
-    s = sub.add_parser("outcome", help="记一次真实使用反馈：validated / insufficient")
+    s = sub.add_parser("outcome", help="记一次真实使用反馈（分档信号）")
     s.add_argument("id")
-    s.add_argument("outcome", choices=["validated", "insufficient"])
+    s.add_argument("outcome", choices=sorted(db.FEEDBACK_DELTAS))
     s.add_argument("--note", default="")
     s.set_defaults(func=cmd_outcome)
 
@@ -508,6 +696,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=5)
     s.add_argument("--repo", default=None, help="只在该仓库内检索")
+    s.add_argument("--freshness", default=None, choices=["ok", "partial", "unverified"],
+                   help="只看指定证据状态的条目")
+    s.add_argument("--stack", default=None,
+                   help="当前项目技术栈（python/node/java/go/rust/docker），跨仓库检索时同栈优先")
     s.add_argument("--json", action="store_true")
     s.add_argument("--any", action="store_true", help="无命中时退化为按置信度取前 N 条")
     s.set_defaults(func=cmd_search)
@@ -564,6 +756,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("replay", help="回放探针：拿它去认自己来源的坏代码，检验自洽")
     s.add_argument("--probe", default=None, help="只回放某一条探针")
+    s.add_argument("--min-hit-rate", type=float, default=None,
+                   help="门禁：可回放探针的命中率低于该值时以退出码 2 失败（建议 0.9）")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_replay)
 
