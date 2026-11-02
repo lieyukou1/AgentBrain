@@ -15,26 +15,37 @@
    不要把人写的规则写成 `probes.py` 里的 if 分支。
 5. **锚点校验只回答事实问题**。`verify` 只判「提交/文件/片段还能不能找到」，
    不做语义判断——语义留给人工两键与使用反馈。
+6. **密钥不进库**。任何新增写入路径都必须经过 `redact`；锚点 excerpt 命中密钥时只能
+   丢弃片段（path/commit 仍可校验），不许写一份改过的"原文"。
+7. **历史只追加**。取代用 `supersedes`，反馈记错用 `revoke`；禁止为了"修正"而删除
+   或覆盖 atoms / outcomes 行，否则 explain 的链会断。
+8. **失败也算知识，但不进 atoms**。试过并确认失败的路径写 `dead_ends`，不生成 claim；
+   它只用于提醒"不要再试"，不参与 accepted 统计与置信度。
+9. **外部评论只取"被后续提交采纳"的配对**。`mine-pr` 全程只读，不落 token、不落评论全文；
+   claim 只保留截断后的一句话，且仍须经过 verify 与人工两键。
 
 ## 2. 改动后的验证顺序
 
 ```bash
 python -m unittest discover -s tests -q     # 全量单测，必须是绿的
-python -m brain replay                      # 探针自洽性：有 from_atom 的规则要能认出自己的坏代码
+python -m brain replay --min-hit-rate 0.9   # 回放门禁：规则与证据不自洽就退出 2
 python -m brain check --diff logs/diffs/real-gap.diff   # 基线 diff 不应新增误报
-python -m brain funnel                      # 看一眼四层指标有没有异常跳变
+python -m brain funnel                      # 四层指标 + token 成本 + 探针误报比
 ```
 
-- 改了探针：必须跑 `replay`。命中不了自己来源的坏代码，要么规则太窄，要么这条经验不是代码形状类
-  （后者应摘掉 `from_atom`，不要硬凑规则）。
+- 改了探针：必须跑 `replay --min-hit-rate 0.9`。命中不了自己来源的坏代码，要么规则太窄，
+  要么这条经验不是代码形状类（后者应摘掉 `from_atom`，不要硬凑规则）。
+  新增探针若写了 `from_atom`，就必须能在回放里命中，否则不要合入。
+- 改了 `mine-pr`：只加 GET，不加写接口；确认日志、异常与返回体里都不出现 token 或评论全文。
 - 改了文档抽取：重跑一律加 `--skip-seen`，否则每个小节都会重新调用一次模型（去重发生在拿到结果之后，
   默认拦不住这笔开销）。
-- 改了检索：先跑 `python -m brain eval` 对比 recall@1 / recall@3 / 空期望误报，
-  再用真实查询回归（中文长句、英文标识符、文件名带下划线三种）。评测集在 `eval/queries.json`，
-  新增查询时宁可标少不标多——把相邻话题算进 expected，会把噪声洗成"命中"。
+- 改了检索：先跑 `python -m brain eval` 对比 recall@1 / recall@3 / precision@3 / 空期望误报 /
+  跨库隔离 / 失效条目 / 超预算 / p95；这些指标缺一项，"变好了"就还是主观感受。
+- 改了写入路径：确认 `verify --candidates-only` 的解析率没有下降，且 `redact` 仍在链路上。
+- 改了 hook：手动在临时仓库跑一次 `brain hook --repo <tmp>` + 提交，确认队列多了一行、
+  原 hook 被备份成 `.pre-brain`，并且 commit 没有被拖慢。
 - 改了检索评分：必须同步 `search.SCORE_VERSION`。分数口径一变，历史 `top_score` 就不可比，
   日志里不标版本等于把旧数据变成噪声。
-- 改了写入路径：确认 `verify --candidates-only` 的解析率没有下降。
 
 ## 3. 代码约定
 
@@ -76,5 +87,8 @@ python -m brain funnel                      # 看一眼四层指标有没有异�
 3. **任务收尾 → `record_outcome`**。只对**本次真的用到**的条目记 `validated`，
    看了但没用上记 `insufficient`；没有真实判定就不记。严禁批量刷分——
    这个字段是漏斗里唯一衡量"经验有没有用"的数据。
+4. **确认走不通 → `record_dead_end`**。把 tried / why_failed / what_worked 写清楚，
+   下次改同一文件时 `search` 会一并返回；不要只写"试过不行"，那对后来者没有信息量。
 
 配套要求：`search` 的 `limit` 默认 3，不要为了"看全"调大；需要完整机制与证据链走 `explain`。
+零命中时按返回的 `guidance` 处理，不要换词反复试；要快速回顾全局用 `brain brief`。
