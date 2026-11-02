@@ -41,14 +41,15 @@ TOOLS = [
         "description": (
             "何时用：动手修改不熟悉的代码前，或不确定某类问题是否踩过坑时，用 2-4 个关键词"
             "检索已沉淀经验。返回 claim、机制、触发条件、反例与证据锚点（commit/文件/片段）。"
-            "关键词是 AND 匹配，零命中即库内没有，不要据此认为无风险。"
+            "默认只给 3 条、只给接近最佳命中的结果，零命中就是库内没有，不要用其它结果凑数，"
+            "也不要据此认为无风险。"
             "查「这段代码在做什么」不要用它，直接读代码。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "问题或代码上下文关键词"},
-                "limit": {"type": "integer", "default": 8},
+                "limit": {"type": "integer", "default": 3},
                 "repo": {"type": "string",
                          "description": "可选：只在该仓库内检索，库里收录了多个项目时用它收窄"},
             },
@@ -193,7 +194,7 @@ def _dispatch(conn, name: str, args: dict) -> dict:
     if name == "search":
         # fallback 必须关掉：无命中就该返回空，而不是拿最高置信度的条目凑数
         return {"results": search.search_atoms(
-            conn, args.get("query", ""), int(args.get("limit", 8)),
+            conn, args.get("query", ""), int(args.get("limit", 3)),
             fallback=False, repo=args.get("repo") or None)}
     if name == "explain":
         row = db.get_atom(conn, args.get("atom_id", ""))
@@ -213,15 +214,8 @@ def _dispatch(conn, name: str, args: dict) -> dict:
         return audit.run(conn, args.get("diff_text", ""), atom_ids=args.get("atom_ids"),
                          record=bool(args.get("record", True)))
     if name == "record_outcome":
-        atom_id = args.get("atom_id", "")
-        outcome = args.get("outcome", "")
-        if outcome not in ("validated", "insufficient"):
-            return {"error": "outcome 必须是 validated 或 insufficient"}
-        if db.get_atom(conn, atom_id) is None:
-            return {"error": "atom 不存在"}
-        db.record_outcome(conn, atom_id, outcome, args.get("note", ""))
-        row = db.get_atom(conn, atom_id)
-        return {"atom_id": atom_id, "confidence": row["confidence"], "status": row["status"]}
+        return ingest.feedback(conn, args.get("atom_id", ""), args.get("outcome", ""),
+                               args.get("note", ""))
     if name == "review_atom":
         return ingest.review(conn, args.get("atom_id", ""), args.get("verdict", ""),
                              args.get("note", ""))
@@ -249,12 +243,25 @@ def _arg_brief(args: dict) -> dict:
     return brief
 
 
-def _result_brief(name: str, payload) -> dict:
+def _result_brief(name: str, payload, args: dict | None = None) -> dict:
     """只留可聚合的计数进日志，正文照旧不落盘。"""
     if not isinstance(payload, dict):
         return {}
     if name == "search":
-        return {"hits": len(payload.get("results") or [])}
+        results = payload.get("results") or []
+        tiers: dict[str, int] = {}
+        for item in results:
+            tier = str(item.get("tier") or "?")
+            tiers[tier] = tiers.get(tier, 0) + 1
+        return {
+            "hits": len(results),
+            # 记下"问了几条"，才能区分"只返回 2 条"和"返回 2 条是因为上限就是 2"
+            "asked": int((args or {}).get("limit", 3)),
+            # 命中强度：判断"返回了但都很勉强"与"库变杂"的分界，只能靠这条时间序列
+            "top_score": max((float(i.get("score") or 0) for i in results), default=0.0),
+            "score_version": search.SCORE_VERSION,
+            "tiers": tiers,
+        }
     if name == "check_diff":
         return {"findings": len(payload.get("findings") or []),
                 "related": len(payload.get("related_atoms") or [])}
@@ -313,7 +320,7 @@ def handle(conn, msg: dict) -> dict | None:
                 raise
             text = json.dumps(payload, ensure_ascii=False)
             _log_call(name, args, True, int((time.perf_counter() - started) * 1000), len(text),
-                      _result_brief(name, payload))
+                      _result_brief(name, payload, args))
             result = {"content": [{"type": "text", "text": text}]}
         elif method == "ping":
             result = {}

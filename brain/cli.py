@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 from . import (  # noqa: F401
-    audit, db, doc_ingest, enrich, funnel, ingest, link, mine, probes, refine, replay, search,
-    verify,
+    audit, db, doc_ingest, enrich, evaluate, funnel, ingest, link, mine, probes, refine, replay,
+    search, verify,
 )
 
 
@@ -170,6 +170,12 @@ def cmd_rate(conn, args) -> int:
     return 3 if result.get("reason") == "unresolved_anchor" else 2
 
 
+def cmd_outcome(conn, args) -> int:
+    result = ingest.feedback(conn, args.id, args.outcome, args.note)
+    _out(result)
+    return 0 if "error" not in result else 2
+
+
 def cmd_search(conn, args) -> int:
     results = search.search_atoms(conn, args.query, limit=args.limit,
                                   fallback=args.any, repo=args.repo)
@@ -180,7 +186,8 @@ def cmd_search(conn, args) -> int:
         print("无命中。加 --any 可查看高置信条目（但那不是检索结果）。")
         return 0
     for r in results:
-        print(f"[{r['id']}] conf={r['confidence']:.2f} {r['status']}  {_short(r['claim'], 140)}")
+        print(f"[{r['id']}] conf={r['confidence']:.2f} score={r.get('score', 0)} "
+              f"{r.get('tier', '?')} {r['status']}  {_short(r['claim'], 140)}")
         for a in r["anchors"][:2]:
             print(f"   - {a['kind']} {a['path'] or a['commit']} {_short(a['excerpt'], 60)}")
         for e in r.get("linked", [])[:2]:
@@ -336,6 +343,11 @@ def cmd_funnel(conn, args) -> int:
     print(f"        search 命中率 {rate(u['search_hit_rate'])}"
           f"｜check_diff 命中率 {rate(u['check_hit_rate'])}"
           f"｜旧日志无计数 {u['unjudged']} 次")
+    if u["search_graded"]:
+        print(f"        检索强度（{u['search_graded']} 次有分数）："
+              f"top_score p50 {u['search_top_score_p50']}｜p90 {u['search_top_score_p90']}"
+              f"｜满额返回 {u['search_full_rate']}"
+              "｜分层 " + " ".join(f"{k}={v}" for k, v in sorted(u["search_tiers"].items())))
     print(f"反馈层：outcome {f['outcomes']} 条，validated {f['validated']}"
           f"（{f['validated_rate']}），其中机器批量判定 {f['auto_graded']} 条")
     print(f"        audit 疑似命中 {f['audit_hits']} 次，覆盖 {f['audit_atoms']} 条经验")
@@ -364,6 +376,21 @@ def cmd_replay(conn, args) -> int:
         status = labels.get(row["status"], row["status"])
         detail = row.get("blocked_by") or row.get("path") or row.get("commit", "")
         print(f"  {row['probe']:<42}{status:<8}{detail}")
+    return 0
+
+
+def cmd_eval(conn, args) -> int:
+    result = evaluate.run(conn, path=args.path, limit=args.limit)
+    if args.json:
+        _out(result)
+        return 0
+    print(f"评测 {result['queries']} 条查询（有期望 {result['graded']}｜空期望 {result['negatives']}）")
+    print(f"recall@1 {result['recall_at_1']}｜recall@3 {result['recall_at_3']}"
+          f"｜有期望却零命中 {result['zero_hit']}｜空期望误报 {result['false_positives']}")
+    for row in result["rows"]:
+        mark = ("✓" if row["hit_at_3"] else "✗") if row["expected"] else \
+               ("!" if row["false_positive"] else "✓")
+        print(f"  {mark} top={row['top_score']:<6} got={len(row['got'])}  {row['query']}")
     return 0
 
 
@@ -471,9 +498,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--note", default="")
     s.set_defaults(func=cmd_rate)
 
+    s = sub.add_parser("outcome", help="记一次真实使用反馈：validated / insufficient")
+    s.add_argument("id")
+    s.add_argument("outcome", choices=["validated", "insufficient"])
+    s.add_argument("--note", default="")
+    s.set_defaults(func=cmd_outcome)
+
     s = sub.add_parser("search", help="检索知识")
     s.add_argument("query")
-    s.add_argument("--limit", type=int, default=10)
+    s.add_argument("--limit", type=int, default=5)
     s.add_argument("--repo", default=None, help="只在该仓库内检索")
     s.add_argument("--json", action="store_true")
     s.add_argument("--any", action="store_true", help="无命中时退化为按置信度取前 N 条")
@@ -517,6 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("stats", help="库健康度")
     s.set_defaults(func=cmd_stats)
+
+    s = sub.add_parser("eval", help="检索回归：真实查询 + 人工标注的期望条目")
+    s.add_argument("--path", default=None, help="评测集路径，默认 eval/queries.json")
+    s.add_argument("--limit", type=int, default=5)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_eval)
 
     s = sub.add_parser("funnel", help="使用漏斗：知识→加工→使用→反馈")
     s.add_argument("--days", type=int, default=7)

@@ -73,6 +73,21 @@ def record(conn, payload: dict) -> dict:
     }
 
 
+def feedback(conn, atom_id: str, outcome: str, note: str = "") -> dict:
+    """记一次任务里的真实反馈。MCP 与 CLI 共用，避免两条入口的词表与计分口径漂移。
+
+    只有 validated / insufficient 两种：前者是"这条经验确实解释了问题"，
+    后者是"这次没用上或误导了人"。机器判定（triage / audit）不走这里。
+    """
+    if outcome not in ("validated", "insufficient"):
+        return {"error": "outcome 必须是 validated 或 insufficient", "reason": "bad_outcome"}
+    if db.get_atom(conn, atom_id) is None:
+        return {"error": "atom 不存在", "reason": "missing"}
+    db.record_outcome(conn, atom_id, outcome, note)
+    row = db.get_atom(conn, atom_id)
+    return {"atom_id": atom_id, "confidence": row["confidence"], "status": row["status"]}
+
+
 def review(conn, atom_id: str, verdict: str, note: str = "") -> dict:
     """人工两键：good 采纳 / bad 退休。CLI 与 MCP 共用，两条入口行为必须一致。
 

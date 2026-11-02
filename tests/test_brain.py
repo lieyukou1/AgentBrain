@@ -382,6 +382,17 @@ class IngestTests(BrainTestBase):
         again = ingest.record(self.conn, payload)
         self.assertTrue(again.get("duplicate"))
 
+    def test_feedback_shares_vocabulary_and_updates_confidence(self):
+        aid = db.add_atom(self.conn, {"claim": "回调在无幂等键时会重复扣款", "confidence": 0.5})
+        bad = ingest.feedback(self.conn, aid, "invalidated")
+        self.assertIn("error", bad)
+        missing = ingest.feedback(self.conn, "a-missing", "validated")
+        self.assertEqual(missing["reason"], "missing")
+        ok = ingest.feedback(self.conn, aid, "validated", "本会话实测")
+        self.assertAlmostEqual(ok["confidence"], 0.65, places=2)
+        down = ingest.feedback(self.conn, aid, "insufficient", "没帮上")
+        self.assertAlmostEqual(down["confidence"], 0.45, places=2)
+
 
 @unittest.skipIf(shutil.which("git") is None, "git 不可用")
 class GuardOnlyTests(BrainTestBase):
@@ -736,6 +747,17 @@ class McpTests(BrainTestBase):
         self.assertTrue(rows[0]["ok"])
         self.assertIsInstance(rows[0]["ms"], int)
 
+    def test_search_brief_records_top_score_and_tiers(self):
+        from brain import mcp
+        brief = mcp._result_brief("search", {"results": [
+            {"id": "a-1", "score": 7.5, "tier": "L1"},
+            {"id": "a-2", "score": 3.1, "tier": "L2"},
+        ]}, {"limit": 4})
+        self.assertEqual(brief["hits"], 2)
+        self.assertEqual(brief["asked"], 4)
+        self.assertEqual(brief["top_score"], 7.5)
+        self.assertEqual(brief["tiers"], {"L1": 1, "L2": 1})
+
     def test_long_argument_is_replaced_by_length(self):
         self._call("check_diff", {"diff_text": "x" * 500})
         log = Path(self.tmp.name) / "logs" / "mcp-calls.jsonl"
@@ -748,7 +770,8 @@ class McpTests(BrainTestBase):
         self._call("search", {"query": "租约"})
         log = Path(self.tmp.name) / "logs" / "mcp-calls.jsonl"
         row = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
-        self.assertEqual(row["result"], {"hits": 1})
+        self.assertEqual(row["result"]["hits"], 1)
+        self.assertGreater(row["result"]["top_score"], 0)
 
     def test_stats_carries_usage_block(self):
         payload = self._call("stats", {})
@@ -955,13 +978,62 @@ class SearchTests(BrainTestBase):
         rows = search.search_atoms(self.conn, "", fallback=True, repo=r"E:\proj-b")
         self.assertEqual(rows, [])
 
-    def test_linked_edges_are_expanded(self):
+    def test_results_carry_score_and_tier(self):
+        """score 用来判断命中强度，tier 用来区分"本项目的约定"与"别处的话题"。
+        两者都不参与过滤，只做标注。"""
+        db.add_atom(self.conn, {"claim": "租约过期后旧实例仍会写入", "confidence": 0.9,
+                                "repo": r"E:\proj-a"})
+        loose = search.search_atoms(self.conn, "租约", fallback=False)
+        self.assertEqual(loose[0]["tier"], "L2")
+        self.assertGreater(loose[0]["score"], 0)
+        same_repo = search.search_atoms(self.conn, "租约", fallback=False, repo=r"E:\proj-a")
+        self.assertEqual(same_repo[0]["tier"], "L1")
+
+    def test_related_marks_same_file_as_l0(self):
+        aid = db.add_atom(self.conn, {"claim": "租约续期用 modified_count 判定会误报"})
+        db.add_anchor(self.conn, aid, "file", path="src/repo/lease.py")
+        hit = search.related(self.conn, "src/repo/lease.py", limit=1)[0]
+        self.assertEqual(hit["tier"], "L0")
+        self.assertGreater(hit["score"], 0)
+
+    def test_linked_edges_are_expanded_only_on_request(self):
+        """默认不带一跳邻居：返回体翻倍，而调用方多数只看前三条的 claim。"""
         a = db.add_atom(self.conn, {"claim": "甲方经验"})
         b = db.add_atom(self.conn, {"claim": "乙方经验"})
         db.add_edge(self.conn, a, "similar", b)
-        hits = search.search_atoms(self.conn, "甲方", fallback=False)
+        plain = search.search_atoms(self.conn, "甲方", fallback=False)
+        self.assertNotIn("linked", plain[0])
+        hits = search.search_atoms(self.conn, "甲方", fallback=False, expand=True)
         self.assertEqual(hits[0]["linked"][0]["id"], b)
         self.assertEqual(hits[0]["linked"][0]["claim"], "乙方经验")
+
+    def test_relative_floor_drops_weak_matches(self):
+        """同一查询里只保留接近最佳命中的条目，不再"凑满限额"。"""
+        strong = db.add_atom(self.conn, {
+            "claim": "租约续租必须同时校验 owner 与幂等键",
+            "mechanism": "并发续租时两个实例都认为自己是持有者",
+            "confidence": 0.9})
+        weak = db.add_atom(self.conn, {
+            "claim": "租约 幂等",
+            "confidence": 0.3})
+        rows = search.search_atoms(self.conn, "租约 续租 幂等", fallback=False, limit=5)
+        ids = [r["id"] for r in rows]
+        self.assertIn(strong, ids)
+        self.assertNotIn(weak, ids)
+
+    def test_coverage_slack_drops_topically_distant_match(self):
+        """最佳命中覆盖全部检索词时，只中一半的条目属于跨话题噪声（分数可能还不低）。"""
+        strong = db.add_atom(self.conn, {
+            "claim": "租约 幂等 续租 owner 必须同时校验",
+            "confidence": 0.9})
+        far = db.add_atom(self.conn, {
+            "claim": "租约 幂等",
+            "mechanism": "租约 幂等",
+            "confidence": 0.9})
+        rows = search.search_atoms(self.conn, "租约 幂等 续租 owner", fallback=False, limit=5)
+        ids = [r["id"] for r in rows]
+        self.assertIn(strong, ids)
+        self.assertNotIn(far, ids)
 
     def test_same_file_match_requires_exact_basename(self):
         """`%a.py` 会把 my_a.py 也算成同一个文件，必须按分隔符对齐。"""
@@ -1320,6 +1392,61 @@ class FunnelTests(BrainTestBase):
         self.assertEqual(set(report), {"knowledge", "processing", "usage", "feedback"})
         self.assertEqual(report["knowledge"]["by_status"], {"accepted": 1})
 
+    def test_usage_reports_top_score_full_rate_and_tiers(self):
+        """判断"检索变差"还是"库变杂"要看 top_score 与满额率的走势，单看命中率不够。"""
+        self._log(
+            {"ts": "2026-10-30T10:00:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result": {"hits": 3, "asked": 3, "top_score": 4.1, "tiers": {"L2": 3}}},
+            {"ts": "2026-10-30T10:01:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result": {"hits": 3, "asked": 3, "top_score": 6.0,
+                        "tiers": {"L1": 2, "L2": 1}}},
+            {"ts": "2026-10-30T10:02:00+08:00", "tool": "search", "ok": True, "ms": 2,
+             "result": {"hits": 1, "asked": 3, "top_score": 9.4, "tiers": {"L0": 1}}},
+        )
+        usage = funnel.usage(days=7, today=date(2026, 10, 30))
+        self.assertEqual(usage["search_graded"], 3)
+        self.assertEqual(usage["search_top_score_p50"], 6.0)
+        self.assertEqual(usage["search_top_score_p90"], 9.4)
+        self.assertEqual(usage["search_full_rate"], 0.667)
+        self.assertEqual(usage["search_tiers"], {"L2": 4, "L1": 2, "L0": 1})
+
+
+class EvaluateTests(BrainTestBase):
+    """评测集是用来防"改完感觉变好了"的，口径必须能被测试钉住。"""
+
+    def _write(self, cases: list[dict]) -> str:
+        path = Path(self.tmp.name) / "queries.json"
+        path.write_text(json.dumps({"queries": cases}, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def test_recall_and_empty_expectation(self):
+        from brain import evaluate
+        aid = db.add_atom(self.conn, {"claim": "租约过期后旧实例仍会写入", "confidence": 0.9})
+        path = self._write([
+            {"query": "租约", "expect": [aid]},
+            {"query": "zzzqqq", "expect": []},
+        ])
+        result = evaluate.run(self.conn, path=path)
+        self.assertEqual(result["recall_at_1"], 1.0)
+        self.assertEqual(result["recall_at_3"], 1.0)
+        self.assertEqual(result["zero_hit"], 0)
+        self.assertEqual(result["false_positives"], 0)
+
+    def test_expected_but_missing_counts_as_zero_hit(self):
+        from brain import evaluate
+        path = self._write([{"query": "zzzqqq", "expect": ["a-missing"]}])
+        result = evaluate.run(self.conn, path=path)
+        self.assertEqual(result["recall_at_3"], 0.0)
+        self.assertEqual(result["zero_hit"], 1)
+
+    def test_hits_on_empty_expectation_are_false_positives(self):
+        from brain import evaluate
+        aid = db.add_atom(self.conn, {"claim": "租约过期后旧实例仍会写入"})
+        path = self._write([{"query": "租约", "expect": []}])
+        result = evaluate.run(self.conn, path=path)
+        self.assertEqual(result["false_positives"], 1)
+        self.assertEqual(result["rows"][0]["got"], [aid])
+
 
 class CallLogTests(BrainTestBase):
     """调用日志会无限增长，轮转必须保留一份历史且读写口径一致。"""
@@ -1423,7 +1550,7 @@ class LinkTests(BrainTestBase):
         first = self._atom("/r", claim="甲经验", path="src/a.py")
         second = self._atom("/r", claim="乙经验", path="src/a.py")
         link.rebuild(self.conn)
-        hits = search.search_atoms(self.conn, "甲经验", fallback=False)
+        hits = search.search_atoms(self.conn, "甲经验", fallback=False, expand=True)
         self.assertEqual(hits[0]["id"], first)
         self.assertEqual(hits[0]["linked"][0]["id"], second)
         self.assertEqual(hits[0]["linked"][0]["claim"], "乙经验")
@@ -1735,7 +1862,12 @@ class CliTests(BrainTestBase):
         self.assertIn("atom_id", json.loads(out))
         code, out = self._run("add", "--claim", "并发写入缺少唯一键会导致重复扣款")
         self.assertEqual(code, 2)
-        self.assertIn("error", json.loads(out))
+
+    def test_outcome_records_real_feedback(self):
+        aid = db.add_atom(self.conn, {"claim": "回调在无幂等键时会重复扣款", "confidence": 0.5})
+        code, out = self._run("outcome", aid, "validated", "--note", "本会话实测")
+        self.assertEqual(code, 0)
+        self.assertAlmostEqual(json.loads(out)["confidence"], 0.65, places=2)
 
     def test_search_reports_no_hit_instead_of_fallback(self):
         db.add_atom(self.conn, {"claim": "唯一的高置信条目", "confidence": 0.9})
