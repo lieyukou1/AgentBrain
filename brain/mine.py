@@ -12,12 +12,64 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from . import db, gitutil
+from . import db, gitutil, redact
 
 REVERT = re.compile(r"^\s*revert\b|revert\s+[\"']|回滚|还原", re.I)
 HOTFIX = re.compile(r"hotfix|紧急|线上|生产事故|rollback|热修", re.I)
 FIX = re.compile(r"\bfix(es|ed)?\b|修复|修正|bug|缺陷", re.I)
 PERF = re.compile(r"\bperf\b|性能|优化|slow|超时问题", re.I)
+
+# 噪声提交：格式化、依赖升级、WIP、合并、自动生成。它们不携带"为什么"，
+# 进库只会把真正的修复信号稀释掉。
+NOISE_SUBJECT = [
+    re.compile(r"^fix(?:ed)?\s*typo\b", re.I),
+    re.compile(r"^typo\b", re.I),
+    re.compile(r"^(?:format|lint|prettier|eslint|style|auto-?format)\b", re.I),
+    re.compile(r"^(?:chore|build)?\(?deps?\)?[:/]?\s*(?:bump|update|upgrade)\b", re.I),
+    re.compile(r"^bump\s+\S+\s+(?:from|to)\b", re.I),
+    re.compile(r"^(?:yarn|npm|pnpm)\s+(?:lock|update)\b", re.I),
+    re.compile(r"^update\s+(?:lock|yarn\.lock|package-lock)", re.I),
+    re.compile(r"^merge\s+(?:branch|pull\s+request|remote)", re.I),
+    re.compile(r"^merge\s+\S+\s+into\s+\S+", re.I),
+    re.compile(r"^(?:wip|temp|tmp|checkpoint|backup)\b", re.I),
+    re.compile(r"^(?:initial\s+commit|first\s+commit|init)\s*$", re.I),
+    re.compile(r"^(?:update|change|fix|edit|modify)\s*$", re.I),
+    re.compile(r"^\[(?:ci|cd)\s+skip\]", re.I),
+    re.compile(r"^(?:auto-?generated|generated\s+by)\b", re.I),
+]
+
+# 只改这些文件时，提交本身没有工程含义
+NOISE_FILES = [
+    re.compile(r"(?:^|/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Gemfile\.lock"
+               r"|Cargo\.lock|poetry\.lock|composer\.lock|go\.sum)$", re.I),
+    re.compile(r"\.min\.(?:js|css)$", re.I),
+    re.compile(r"\.map$", re.I),
+    re.compile(r"(?:^|/)(?:dist|build|out)/", re.I),
+    re.compile(r"(?:^|/)(?:\.DS_Store|Thumbs\.db)$", re.I),
+]
+
+
+def is_noise(subject: str, files: list[str]) -> bool:
+    if any(p.search(subject) for p in NOISE_SUBJECT):
+        return True
+    return bool(files) and all(any(p.search(f) for p in NOISE_FILES) for f in files)
+
+
+def commit_kind(subject: str) -> str:
+    """粗分提交意图，只用于统计与 revert 分流，不参与知识生成。"""
+    text = subject.strip()
+    patterns = (
+        ("revert", REVERT), ("hotfix", HOTFIX), ("fix", FIX), ("perf", PERF),
+        ("docs", re.compile(r"^docs?\b|文档", re.I)),
+        ("test", re.compile(r"^tests?\b|^spec\b|测试", re.I)),
+        ("refactor", re.compile(r"^refactor\b|^cleanup\b|重构|整理", re.I)),
+    )
+    for name, pattern in patterns:
+        if pattern.search(text):
+            return name
+    return "other"
+
+
 GUARD = re.compile(
     r"timeout|deadline|retry|backoff|jitter|lock|mutex|synchronized|atomic|idempot|"
     r"unique|transaction|rollback|超时|重试|退避|锁|幂等|唯一|事务",
@@ -83,21 +135,41 @@ def _claim_for(subject: str, signals: list[str], test_added: bool) -> tuple[str,
     return ("", "", "")
 
 
-def mine_repo(conn, repo: str, limit: int = 200, since: str | None = None) -> dict:
+def mine_repo(conn, repo: str, limit: int = 200, since: str | None = None,
+              shas: list[str] | None = None) -> dict:
     repo = str(repo)
     if not gitutil.is_repo(repo):
         return {"repo": repo, "error": "not-a-git-repo", "created": 0, "scanned": 0}
 
-    commits = gitutil.log_commits(repo, limit=limit, since=since)
+    if shas:
+        commits = [c for c in (gitutil.commit_info(repo, s) for s in shas) if c]
+    else:
+        commits = gitutil.log_commits(repo, limit=limit, since=since)
     created = skipped = clues_added = 0
+    by_kind: Counter[str] = Counter()
     for c in commits:
         subject = c["subject"]
-        signals = _signals(subject)
-        if not signals:
-            continue
         files = gitutil.changed_files(repo, c["sha"])
         if not files:
             continue
+        by_kind[commit_kind(subject)] += 1
+        # 噪声提交在读 diff、算信号之前就丢掉：它们没有"为什么"可记
+        if is_noise(subject, files):
+            skipped += 1
+            continue
+        signals = _signals(subject)
+        if not signals:
+            continue
+
+        # 回滚 = 这条做法已被证伪。它不该长成一条 claim（没解释为什么失败），
+        # 而应该进 dead_ends，让下次改同一文件时被提醒。
+        if "revert" in signals:
+            for path in files[:3]:
+                db.add_dead_end(conn, repo, path, subject,
+                                why_failed="该改动随后被回滚", commit_sha=c["sha"])
+            created += 1
+            continue
+
         adds = gitutil.added_lines(repo, c["sha"])
         test_added = any(TEST_FILE.search(f) for f in files)
         # guard 只认代码行：注释与提示语不算
@@ -105,7 +177,7 @@ def mine_repo(conn, repo: str, limit: int = 200, since: str | None = None) -> di
         guard_lines = [(f, ln, tok) for f, ln, tok in guard_lines if tok][:3]
 
         # 硬信号才升格为 atom；guard-only 降级为探针线索
-        hard = ("revert" in signals or "hotfix" in signals or "perf" in signals
+        hard = ("hotfix" in signals or "perf" in signals
                 or ("fix" in signals and test_added))
         if not hard:
             if guard_lines:
@@ -124,6 +196,9 @@ def mine_repo(conn, repo: str, limit: int = 200, since: str | None = None) -> di
         claim, mechanism, conditions = _claim_for(subject, signals, test_added)
         if not claim:
             continue
+        claim = redact.clean_text(claim)[0]
+        mechanism = redact.clean_text(mechanism)[0]
+        conditions = redact.clean_text(conditions)[0]
         aid = db.add_atom(conn, {
             "claim": claim,
             "mechanism": mechanism,
@@ -133,16 +208,21 @@ def mine_repo(conn, repo: str, limit: int = 200, since: str | None = None) -> di
             "repo": repo,
             "commit_sha": c["sha"],
         })
+        # 提交摘要与片段都可能带出环境变量；excerpt 一旦被改写就不可校验，
+        # 所以命中密钥时直接丢掉片段，只保留 commit / path 锚点。
+        subject = redact.clean_text(subject)[0]
         db.add_anchor(conn, aid, "commit", path="", commit_sha=c["sha"], excerpt=subject)
         for f in files[:4]:
-            excerpt = next((ln for pf, ln, _ in guard_lines if pf == f), "")
-            db.add_anchor(conn, aid, "file", path=f, commit_sha=c["sha"], excerpt=excerpt.strip())
+            excerpt = next((ln for pf, ln, _ in guard_lines if pf == f), "").strip()
+            if excerpt and redact.has_secret(excerpt):
+                excerpt = ""
+            db.add_anchor(conn, aid, "file", path=f, commit_sha=c["sha"], excerpt=excerpt)
         created += 1
 
     churn_created = _mine_churn(conn, repo, commits)
     return {"repo": repo, "scanned": len(commits), "created": created,
             "churn_created": churn_created, "skipped": skipped,
-            "clues_added": clues_added}
+            "clues_added": clues_added, "by_kind": dict(by_kind)}
 
 
 def _mine_churn(conn, repo: str, commits: list[dict]) -> int:

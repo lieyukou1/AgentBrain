@@ -14,7 +14,7 @@ import re
 import time
 from pathlib import Path
 
-from . import db, gitutil, llm, verify
+from . import db, gitutil, llm, redact, verify
 from .enrich import GENERIC
 
 DOC_SUFFIXES = (".md", ".mdx", ".rst", ".txt")
@@ -207,7 +207,7 @@ def run(conn, root: str, only: str | None = None, limit: int | None = None,
 
     stats = {"root": str(root_path), "repo": str(base), "docs": len(docs),
              "sections": len(jobs), "selected": len(selected), "seen_skipped": seen_skipped,
-             "created": 0, "rejected": 0, "skipped": 0,
+             "created": 0, "rejected": 0, "skipped": 0, "secret_skipped": 0,
              "duplicates": 0, "errors": 0, "dry_run": dry_run, "details": []}
     for rel, section in selected:
         prompt = TEMPLATE.format(path=rel, heading=section["heading"] or "(无标题)",
@@ -257,8 +257,18 @@ def run(conn, root: str, only: str | None = None, limit: int | None = None,
                 if progress:
                     progress(item)
                 continue
-            claim = str(entry["claim"]).strip()
+            claim = redact.clean_text(str(entry["claim"]).strip())[0]
             excerpt = str(entry["excerpt"]).strip()
+            if redact.has_secret(excerpt):
+                # 文档锚点必须逐字可查；改一个字锚点就废，所以整条跳过。
+                stats["secret_skipped"] += 1
+                item = {"path": rel, "heading": section["heading"],
+                        "verdict": "secret_skipped",
+                        "reason": "excerpt 含疑似密钥，未入库"}
+                stats["details"].append(item)
+                if progress:
+                    progress(item)
+                continue
             if _duplicate(conn, str(base), claim, rel, excerpt):
                 stats["duplicates"] += 1
                 item = {"path": rel, "heading": section["heading"],
@@ -278,9 +288,9 @@ def run(conn, root: str, only: str | None = None, limit: int | None = None,
                 continue
             aid = db.add_atom(conn, {
                 "claim": claim,
-                "mechanism": str(entry.get("mechanism", "")).strip(),
-                "conditions": str(entry.get("conditions", "")).strip(),
-                "counter": str(entry.get("counter", "")).strip(),
+                "mechanism": redact.clean_text(str(entry.get("mechanism", "")).strip())[0],
+                "conditions": redact.clean_text(str(entry.get("conditions", "")).strip())[0],
+                "counter": redact.clean_text(str(entry.get("counter", "")).strip())[0],
                 "derivation": "doc",
                 "confidence": CONFIDENCE,
                 "repo": str(base),

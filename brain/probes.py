@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
-from . import db, search
+from . import calllog, db, search
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 # 测试、文档与快照夹具不需要生产级并发/幂等保护，默认跳过（探针可用 include_tests=true 覆盖）
@@ -162,16 +163,63 @@ def related_by_hint(conn, probe: dict, limit: int = 2) -> list[dict]:
     return out
 
 
+def probe_ratios(conn, min_hits: int = 3, min_fp: int = 3,
+                 min_rate: float = 0.5) -> dict:
+    """每个探针的命中次数与误报率。
+
+    命中来自 check_diff 的调用日志（只记了探针 id 列表，不落 diff 正文）；
+    误报来自 `record_outcome(..., "probe_false_positive", note="probe:<id>")`。
+    误报次数与误报率同时达标才建议降级：偶尔一次误报可能只是规则边界没写全。
+    """
+    hits: Counter = Counter()
+    for call in calllog.read():
+        if call.get("tool") != "check_diff":
+            continue
+        for pid in (call.get("result") or {}).get("probes") or []:
+            hits[str(pid)] += 1
+    fps: Counter = Counter()
+    for row in conn.execute(
+            "SELECT note FROM outcomes WHERE outcome='probe_false_positive'"):
+        note = str(row["note"] or "")
+        if note.startswith("probe:"):
+            pid = note.split(":", 1)[1].strip()
+            if pid:
+                fps[pid] += 1
+    out: dict[str, dict] = {}
+    for pid in sorted(set(hits) | set(fps)):
+        h, fp = hits[pid], fps[pid]
+        rate = round(fp / h, 3) if h else None
+        out[pid] = {
+            "hits": h,
+            "false_positives": fp,
+            "rate": rate,
+            "downgrade": bool(h and fp >= min_fp and rate is not None and rate >= min_rate),
+        }
+    return out
+
+
+def noisy_probes(conn) -> dict:
+    return {pid: info for pid, info in probe_ratios(conn).items() if info["downgrade"]}
+
+
 def run_check(conn, diff_text: str) -> dict:
     probes = load_probes()
     files = parse_diff(diff_text, code_only=True)
+    noisy = noisy_probes(conn)
     findings = []
+    downgraded_hits = 0
     for path, added in files.items():
         if not added:
             continue
         for probe in probes:
             verdict = evaluate(probe, path, added)
             if not verdict["hit"]:
+                continue
+            if probe["id"] in noisy:
+                # 误报率过高：不再当"必须看的发现"，降级成线索（可能有防护逻辑，但不构成告警）
+                db.add_clue(conn, "", path, probe["id"],
+                            _line_at(added, verdict["line"]), "")
+                downgraded_hits += 1
                 continue
             findings.append({
                 "probe": probe["id"],
@@ -183,14 +231,37 @@ def run_check(conn, diff_text: str) -> dict:
                 "from_atom": probe.get("from_atom", ""),
                 "atoms": _related_for(conn, path, probe),
             })
+    # 死路与探针分开报：探针说"这段代码像历史坑"，死路说"这个文件里有人试过什么且失败了"。
+    # 同一文件累计 3 条失败尝试就升级为 block，理由与 projectmem 一致：
+    # 一次失败可能是偶然，三次说明这条路在这个文件上确实走不通。
+    counts = db.dead_end_counts(conn, list(files.keys()))
+    dead = []
+    for path, count in sorted(counts.items(), key=lambda x: -x[1]):
+        dead.append({
+            "path": path,
+            "count": count,
+            "severity": "block" if count >= 3 else "warn",
+            "items": [dict(r) for r in db.dead_ends_for(conn, path=path, limit=3)],
+        })
     return {
         "files_scanned": len(files),
         "probes": len(probes),
         "findings": findings,
+        "dead_ends": dead,
+        # 降级不等于删除：误报率过高的探针仍会留痕，但只以 clue 形式存在
+        "downgraded": noisy,
+        "downgraded_hits": downgraded_hits,
         # 没有命中时也给一句「这些文件上有哪些经验」：否则调用方拿不到 atom_id，
         # record_outcome 就永远没有可评对象，反馈闭环断在第一步。
         "related_atoms": related_atoms(conn, files) if not findings else [],
     }
+
+
+def _line_at(added: list[tuple[int, str]], lineno: int | None) -> str:
+    for no, line in added:
+        if no == lineno:
+            return line.strip()[:300]
+    return ""
 
 
 def evaluate(probe: dict, path: str, added: list[tuple[int, str]]) -> dict:

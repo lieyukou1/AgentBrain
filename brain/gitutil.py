@@ -41,6 +41,18 @@ def log_commits(path: str | Path, limit: int = 200, since: str | None = None) ->
     return commits
 
 
+def commit_info(path: str | Path, sha: str) -> dict | None:
+    """按提交号取单条摘要；队列驱动的挖掘只处理被 hook 记下的那几个提交。"""
+    code, out = git(path, "log", "-1", "--no-merges", "--date=short",
+                    "--format=%H%x1f%ad%x1f%s", sha)
+    if code != 0:
+        return None
+    parts = out.strip().split("\x1f")
+    if len(parts) != 3:
+        return None
+    return {"sha": parts[0], "date": parts[1], "subject": parts[2]}
+
+
 def changed_files(path: str | Path, sha: str) -> list[str]:
     code, out = git(path, "show", "--name-only", "--format=", sha)
     if code != 0:

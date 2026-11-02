@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, timedelta
 
-from . import calllog
+from . import calllog, probes, replay
 
 
 def _read_calls() -> list[dict]:
@@ -90,6 +90,14 @@ def usage(days: int = 7, today: date | None = None) -> dict:
         for name, n in (c["result"].get("tiers") or {}).items():
             tiers[str(name)] += int(n)
 
+    # token 账本：旧日志没有 result_tokens，只统计有字段的那部分，不拿 0 拉低均值
+    tokens = sorted(int(c["result_tokens"]) for c in calls
+                    if c.get("tool") == "search" and "result_tokens" in c)
+    returned = sorted(int((c.get("result") or {}).get("hits") or 0) for c in calls
+                      if c.get("tool") == "search" and "result_tokens" in c)
+    bytes_used = sorted(int(c["result_bytes"]) for c in calls
+                        if c.get("tool") == "search" and "result_bytes" in c)
+
     def pick(values: list[float], q: float) -> float | None:
         if not values:
             return None
@@ -108,6 +116,10 @@ def usage(days: int = 7, today: date | None = None) -> dict:
         "search_top_score_p90": pick(top_scores, 0.9),
         "search_full_rate": round(full / len(graded), 3) if graded else None,
         "search_tiers": dict(tiers),
+        "search_tokens_p50": pick(tokens, 0.5),
+        "search_tokens_p90": pick(tokens, 0.9),
+        "search_bytes_p50": pick(bytes_used, 0.5),
+        "search_returned_avg": round(sum(returned) / len(returned), 2) if returned else None,
         "check_calls": checked,
         "check_hit_rate": round(check_hit / checked, 3) if checked else None,
         "unjudged": judgeable - searched - checked,
@@ -115,7 +127,8 @@ def usage(days: int = 7, today: date | None = None) -> dict:
 
 
 def feedback(conn) -> dict:
-    total = _one(conn, "SELECT COUNT(*) FROM outcomes")
+    # 取代是结构性事件，不是使用反馈：它不该稀释 validated_rate
+    total = _one(conn, "SELECT COUNT(*) FROM outcomes WHERE outcome!='superseded'")
     validated = _one(conn, "SELECT COUNT(*) FROM outcomes WHERE outcome='validated'")
     auto = _one(conn, "SELECT COUNT(*) FROM outcomes WHERE note LIKE 'triage:%'"
                      " OR note LIKE 'auto-pruned%'")
@@ -124,8 +137,8 @@ def feedback(conn) -> dict:
     audit_atoms = _one(conn, "SELECT COUNT(DISTINCT atom_id) FROM outcomes"
                             " WHERE note LIKE 'audit:%'")
     real = _one(conn, "SELECT COUNT(DISTINCT atom_id) FROM outcomes"
-                      " WHERE note NOT LIKE 'triage:%' AND note NOT LIKE 'auto-pruned%'"
-                      " AND note NOT LIKE 'audit:%'")
+                      " WHERE outcome!='superseded' AND note NOT LIKE 'triage:%'"
+                      " AND note NOT LIKE 'auto-pruned%' AND note NOT LIKE 'audit:%'")
     accepted = _one(conn, "SELECT COUNT(*) FROM atoms WHERE status='accepted'")
     return {
         "outcomes": total,
@@ -134,6 +147,7 @@ def feedback(conn) -> dict:
         "auto_graded": auto,
         "audit_hits": audit_events,
         "audit_atoms": audit_atoms,
+        "superseded": _one(conn, "SELECT COUNT(*) FROM outcomes WHERE outcome='superseded'"),
         "real_feedback_atoms": real,
         # 这是整个漏斗的落点：多少条"可依赖"其实只是"格式合格"
         "accepted_without_real_feedback": max(0, accepted - real),
@@ -146,4 +160,8 @@ def report(conn, days: int = 7) -> dict:
         "processing": processing(conn),
         "usage": usage(days),
         "feedback": feedback(conn),
+        # 探针自洽性快照由 `brain replay` 写入；没跑过就是 None，不在这里偷偷跑 git
+        "probes": replay.last_record(),
+        # 每个探针的命中 / 误报比：误报率过高时 check_diff 会自动降级为 clue
+        "probe_feedback": probes.probe_ratios(conn),
     }

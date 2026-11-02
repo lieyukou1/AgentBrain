@@ -57,3 +57,14 @@ def read() -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return rows
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
+
+    接真实 tokenizer 要引第三方依赖，而这里只需要判断"返回体是不是在变胖"，
+    相对趋势比绝对值重要，所以宁可给一个可解释的近似。
+    """
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    other = len(text) - ascii_chars
+    return (ascii_chars + 3) // 4 + other

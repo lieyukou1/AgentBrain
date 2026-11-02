@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import time
 
-from . import db, gitutil, llm
+from . import db, gitutil, llm, redact
 
 PROMPT_VERSION = "enrich-v1"
 
@@ -154,6 +154,7 @@ def run(conn, limit: int | None = None, model: str = llm.DEFAULT_MODEL,
             if progress:
                 progress(item)
             continue
+        payload, _ = redact.clean_fields(payload)
         ok, reason = validate(payload, row["claim"], files,
                               require_change=row["derivation"] != "llm-enriched")
         if not ok:

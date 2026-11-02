@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from . import db, gitutil, probes
 
 
@@ -78,4 +80,40 @@ def replay_all(conn, only_probe: str | None = None) -> dict:
     for row in rows:
         if row["status"] == "miss":
             blocked[row["blocked_by"]] = blocked.get(row["blocked_by"], 0) + 1
-    return {"total": len(rows), "by_status": counts, "blocked_by": blocked, "rows": rows}
+    # 命中率只算「真的跑起来了」的探针：no_source / no_commit 是数据缺口，
+    # 不是规则不自洽；把它们算进分母会让一个没提交锚点的旧库永远过不了门禁。
+    runnable = counts.get("hit", 0) + counts.get("miss", 0)
+    return {
+        "total": len(rows),
+        "by_status": counts,
+        "blocked_by": blocked,
+        "hit_rate": round(counts.get("hit", 0) / runnable, 3) if runnable else None,
+        "unrunnable": len(rows) - runnable,
+        "misses": [r["probe"] for r in rows if r["status"] == "miss"],
+        "rows": rows,
+    }
+
+
+def record_path():
+    path = db.home() / "logs" / "replay.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def record(result: dict) -> dict:
+    """落一份快照给 funnel 读：funnel 不该为了看指标再跑一遍 git。"""
+    snapshot = {k: v for k, v in result.items() if k != "rows"}
+    snapshot["ran_at"] = db.now()
+    record_path().write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+                             encoding="utf-8")
+    return snapshot
+
+
+def last_record() -> dict | None:
+    path = record_path()
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None

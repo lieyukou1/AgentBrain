@@ -7,12 +7,19 @@
 """
 from __future__ import annotations
 
-from . import db, gitutil, verify
+from . import db, gitutil, redact, verify
 
 MIN_CLAIM = 8
 
 
+def _clean_note(note: str) -> str:
+    """outcomes 也会落库，反馈备注同样不能带出密钥。"""
+    return redact.clean_text(note)[0]
+
+
 def record(conn, payload: dict) -> dict:
+    # 先脱敏再校验：去重与长度判断都应该针对最终入库的文本。
+    payload, redacted = redact.clean_fields(payload)
     claim = (payload.get("claim") or "").strip()
     if len(claim) < MIN_CLAIM:
         return {"error": f"claim 需为一句可证伪的陈述（至少 {MIN_CLAIM} 字）"}
@@ -26,6 +33,15 @@ def record(conn, payload: dict) -> dict:
     path = (payload.get("path") or "").strip()
     if not commit and not path:
         return {"error": "至少需要一个锚点：commit 或 path"}
+
+    # 取代必须先校验旧条目存在，否则新条目写进去了、旧的没退，库会同时留下两条结论。
+    supersedes = (payload.get("supersedes") or "").strip()
+    if supersedes:
+        old = db.get_atom(conn, supersedes)
+        if old is None:
+            return {"error": "被取代的 atom 不存在", "reason": "missing_old"}
+        if old["superseded_by"]:
+            return {"error": f"已被 {old['superseded_by']} 取代", "reason": "already_superseded"}
 
     dup = conn.execute(
         "SELECT id FROM atoms WHERE repo=? AND claim=? LIMIT 1", (repo, claim)
@@ -50,6 +66,11 @@ def record(conn, payload: dict) -> dict:
     })
 
     excerpt = (payload.get("excerpt") or "").strip()
+    if excerpt and redact.has_secret(excerpt):
+        # excerpt 必须逐字可查，替换后锚点必失效；宁可丢掉片段，
+        # 保留 commit/path 锚点（verify 对空 excerpt 只校验文件存在）。
+        excerpt = ""
+        redacted = [*redacted, "excerpt"]
     if commit:
         db.add_anchor(conn, aid, "commit", commit_sha=commit, excerpt=excerpt or claim)
     if path:
@@ -60,15 +81,20 @@ def record(conn, payload: dict) -> dict:
 
     row = db.get_atom(conn, aid)
     resolved, total = verify.verify_atom(conn, row)
+    superseded = None
+    if supersedes:
+        superseded = db.supersede(conn, supersedes, aid)
     note = None
     if repo and not gitutil.is_repo(repo):
         note = "repo 不是 git 仓库，仅 path 锚点可做文件校验"
     return {
         "atom_id": aid,
-        "status": row["status"],
+        "status": db.get_atom(conn, aid)["status"],
         "repo": repo,
         "anchors_resolved": f"{resolved}/{total}",
         "note": note,
+        "redacted": redacted,
+        "superseded": superseded,
         "next": "等待 review：good 采纳（MCP review_atom / CLI brain rate），bad 退休",
     }
 
@@ -76,16 +102,20 @@ def record(conn, payload: dict) -> dict:
 def feedback(conn, atom_id: str, outcome: str, note: str = "") -> dict:
     """记一次任务里的真实反馈。MCP 与 CLI 共用，避免两条入口的词表与计分口径漂移。
 
-    只有 validated / insufficient 两种：前者是"这条经验确实解释了问题"，
-    后者是"这次没用上或误导了人"。机器判定（triage / audit）不走这里。
+    信号分档见 `db.FEEDBACK_DELTAS`：validated / insufficient 是旧词，
+    used / not-used / failed / corrected / strengthen / weaken / code-conflict
+    用来表达"只提供线索""验证失败""判断被纠正"等更细的情形。
+    机器判定（triage / audit）不走这里。
     """
-    if outcome not in ("validated", "insufficient"):
-        return {"error": "outcome 必须是 validated 或 insufficient", "reason": "bad_outcome"}
+    if outcome not in db.FEEDBACK_DELTAS:
+        return {"error": f"outcome 必须是 {', '.join(sorted(db.FEEDBACK_DELTAS))} 之一",
+                "reason": "bad_outcome"}
     if db.get_atom(conn, atom_id) is None:
         return {"error": "atom 不存在", "reason": "missing"}
-    db.record_outcome(conn, atom_id, outcome, note)
+    db.record_outcome(conn, atom_id, outcome, _clean_note(note))
     row = db.get_atom(conn, atom_id)
-    return {"atom_id": atom_id, "confidence": row["confidence"], "status": row["status"]}
+    return {"atom_id": atom_id, "outcome": outcome,
+            "confidence": row["confidence"], "status": row["status"]}
 
 
 def review(conn, atom_id: str, verdict: str, note: str = "") -> dict:
@@ -109,12 +139,12 @@ def review(conn, atom_id: str, verdict: str, note: str = "") -> dict:
         conn.execute("UPDATE atoms SET status='accepted', updated_at=? WHERE id=?",
                      (db.now(), atom_id))
         conn.commit()
-        db.record_outcome(conn, atom_id, "validated", note or "manual-review")
+        db.record_outcome(conn, atom_id, "validated", _clean_note(note or "manual-review"))
     else:
         conn.execute("UPDATE atoms SET status='retired', updated_at=? WHERE id=?",
                      (db.now(), atom_id))
         conn.commit()
-        db.record_outcome(conn, atom_id, "insufficient", note or "manual-review")
+        db.record_outcome(conn, atom_id, "insufficient", _clean_note(note or "manual-review"))
 
     updated = db.get_atom(conn, atom_id)
     return {"atom_id": atom_id, "status": updated["status"],
