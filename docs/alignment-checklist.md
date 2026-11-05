@@ -255,3 +255,12 @@
 - `mine-pr` 只支持 GitHub；GitLab MR 需要另写适配层（未做）。
 - 回放门禁依赖本地知识库与仓库历史，无法在 GitHub Actions 里跑；当前以本地 `--min-hit-rate` 与可选 pre-commit 落地。
 - 探针降级是"运行时跳过并转 clue"，不修改 `probes/*.json`；要彻底移除仍需人工删规则。
+
+### 2026-11-05：收尾项
+
+| 项 | 改动 | 验证 |
+| --- | --- | --- |
+| A5 评测集补作用域样例 | `eval/queries.json` 增加 3 条带 `repo` 的查询（Recurrence / ai-radar / match），`version` 与 `score_version` 升到 2 | `brain eval`：20 条查询，`scope_isolation=1.0`，超预算 0/8192B；A5 遗留的"无 repo 用例"与"超预算 2 条"均已消除 |
+| 探针数据缺口 | ai-radar 历史已压成单个初始提交，`max-tokens-too-small-for-reasoning` 无父版本可回放；新增 `replay: false` 显式豁免，保留 `from_atom` 供 check 溯源 | `brain replay --min-hit-rate 0.9`：5/5 命中、数据缺口 0；新增用例覆盖豁免不计入分母 |
+| B9 stack 自动推断 | `search.current_stack`：省略 `--stack` 时按 `repo` → 进程 cwd 顺序识别 manifest；显式传值仍覆盖 | `SearchTests` 自动识别用例通过；cwd 无 manifest 时行为与改造前一致 |
+| `mine-pr` 实跑 | 当前环境既无 `GITHUB_TOKEN`/`GH_TOKEN`，也未安装 `gh`，无法完成真实 API 验证 | 阻塞；代码路径已由 mock 测试覆盖，待提供只读 token 后跑一次 `--dry-run` |

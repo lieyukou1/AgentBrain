@@ -38,7 +38,7 @@ python -m brain doc-ingest docs --skip-seen   # 只处理没抽过的小节，�
 python -m brain search "回调 幂等 重复扣款"
 python -m brain search "租约" --repo E:\work\my-service   # 多项目库按仓库收窄
 python -m brain search "租约" --freshness ok              # 只看证据仍可解析的条目
-python -m brain search "租约" --stack python              # 跨仓库检索时同栈优先，仅影响排序
+python -m brain search "租约" --stack python              # 跨仓库检索时同栈优先；省略则按 repo/cwd 自动识别
 git diff | python -m brain check
 python -m brain replay            # 回放：探针能否认出自己来源的坏代码
 python -m brain replay --min-hit-rate 0.9   # 门禁：低于阈值时退出码 2（CI / pre-commit 用）
