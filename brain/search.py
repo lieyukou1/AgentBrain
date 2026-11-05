@@ -72,6 +72,21 @@ def detect_stack(path) -> tuple[str, ...]:
     return _STACK_CACHE[key]
 
 
+def current_stack(repo: str | None = None) -> str | None:
+    """当前工作栈：优先看被检索的仓库，其次看进程 cwd。
+
+    调用方不必再手填 `--stack`；cwd 不是仓库或没有 manifest 时返回 None，
+    此时同栈加分为 0，行为与改造前一致。
+    """
+    for candidate in (repo, os.getcwd()):
+        if not candidate:
+            continue
+        stacks = detect_stack(candidate)
+        if stacks:
+            return stacks[0]
+    return None
+
+
 def freshness_of(conn, atom_id: str) -> str:
     """锚点还能不能支撑这条结论。
 
@@ -182,11 +197,15 @@ def search_atoms(conn, query: str, limit: int = 10, fallback: bool = True,
 
     过滤与排序都在内存里做：词数很少、表也不大，一条 SQL 拼 OR 反而既慢又容易漏。
 
-    stack 非空时给同栈条目加 STACK_BONUS（只影响排序，不参与门槛判定）：
+    stack 省略时自动按 repo / 当前工作目录识别；显式传入则覆盖自动识别。
+    同栈条目加 STACK_BONUS（只影响排序，不参与门槛判定）：
     跨仓库检索里，"同样写 Python"比"同样写 Java"更可能适用，但这不足以构成一条证据。
     """
     tokens = tokenize(query)
     target = _norm_repo(repo) if repo else ""
+    if stack is None:
+        # 不传就自动识别：手填 stack 只在"当前进程不在目标项目里"时才需要
+        stack = current_stack(repo or None)
     tier = tier_for("same_repo" if target else "")
     rows: list = []
     if tokens:

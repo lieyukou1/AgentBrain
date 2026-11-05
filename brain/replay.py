@@ -70,7 +70,9 @@ def replay_all(conn, only_probe: str | None = None) -> dict:
     for probe in probes.load_probes():
         if only_probe and probe["id"] != only_probe:
             continue
-        if not probe.get("from_atom"):
+        # replay=false 是显式豁免：来源仓库历史被压成单个初始提交、没有父版本可回放时，
+        # 保留 from_atom 供 check 溯源，但不把它算进命中率分母。
+        if not probe.get("from_atom") or probe.get("replay") is False:
             continue
         rows.append(replay_one(conn, probe))
     counts: dict[str, int] = {}

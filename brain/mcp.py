@@ -59,7 +59,7 @@ TOOLS = [
                               "description": "可选：只看指定证据状态的条目"},
                 "stack": {"type": "string",
                           "description": "可选：当前项目技术栈（python/node/java/go/rust/docker），"
-                                         "跨仓库检索时同栈条目优先，仅影响排序"}
+                                         "跨仓库检索时同栈条目优先；省略时按 repo/服务进程 cwd 自动识别"}
             },
             "required": ["query"],
         },

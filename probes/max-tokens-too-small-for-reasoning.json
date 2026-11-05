@@ -2,6 +2,8 @@
   "id": "max-tokens-too-small-for-reasoning",
   "severity": "medium",
   "from_atom": "a-8a1e4ce1d670",
+  "replay": false,
+  "replay_note": "来源仓库 ai-radar 的历史已压成单个初始提交，没有父版本可回放；保留 from_atom 供 check 溯源，命中率不计入此条",
   "message": "思考模型的 max_tokens 里推理 token 也计数：只按最终输出长度设三位数时，推理阶段会先耗尽预算，返回空内容",
   "atom_hint": "max_tokens|推理|预算|截断|finish_reason|思考",
   "added_any": [

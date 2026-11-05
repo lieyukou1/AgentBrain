@@ -1333,6 +1333,23 @@ class SearchTests(BrainTestBase):
         second = search.search_atoms(self.conn, "租约 续租", fallback=False, stack="java")
         self.assertEqual(Path(second[0]["repo"]).name, "proj-java")
 
+    def test_stack_is_auto_detected_from_cwd(self):
+        """不传 stack 时按当前目录识别，调用方不必手填。"""
+        py = Path(self.tmp.name) / "auto-py"
+        java = Path(self.tmp.name) / "auto-java"
+        py.mkdir()
+        java.mkdir()
+        (py / "pyproject.toml").write_text("", encoding="utf-8")
+        (java / "pom.xml").write_text("", encoding="utf-8")
+        db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8,
+                                "repo": str(py)})
+        db.add_atom(self.conn, {"claim": "租约续租必须校验 owner", "confidence": 0.8,
+                                "repo": str(java)})
+        with mock.patch.object(search.os, "getcwd", return_value=str(py)):
+            rows = search.search_atoms(self.conn, "租约 续租", fallback=False)
+        self.assertEqual(Path(rows[0]["repo"]).name, "auto-py")
+        self.assertEqual(search.current_stack(str(java)), "java")
+
     def test_related_marks_same_file_as_l0(self):
         aid = db.add_atom(self.conn, {"claim": "租约续期用 modified_count 判定会误报"})
         db.add_anchor(self.conn, aid, "file", path="src/repo/lease.py")
@@ -2359,6 +2376,14 @@ class ReplayTests(BrainTestBase):
         self.assertEqual(report["by_status"], {"hit": 1})
         self.assertEqual(report["hit_rate"], 1.0)
         self.assertEqual(report["unrunnable"], 0)
+
+    def test_replay_false_is_an_explicit_exemption(self):
+        """仓库历史被压成单个提交时没有父版本可回放；保留溯源但不算命中率。"""
+        exempt = {**self.PROBE, "from_atom": "a-1", "replay": False}
+        with mock.patch.object(replay.probes, "load_probes", return_value=[exempt]):
+            report = replay.replay_all(self.conn)
+        self.assertEqual(report["total"], 0)
+        self.assertIsNone(report["hit_rate"])
 
     def test_hit_rate_excludes_data_gaps_from_denominator(self):
         """no_commit 是数据缺口，不是规则不自洽；算进分母会让旧库永远过不了门禁。"""

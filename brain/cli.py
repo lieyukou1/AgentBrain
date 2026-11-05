@@ -699,7 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--freshness", default=None, choices=["ok", "partial", "unverified"],
                    help="只看指定证据状态的条目")
     s.add_argument("--stack", default=None,
-                   help="当前项目技术栈（python/node/java/go/rust/docker），跨仓库检索时同栈优先")
+                   help="当前项目技术栈（python/node/java/go/rust/docker）；省略时按 repo/cwd 自动识别")
     s.add_argument("--json", action="store_true")
     s.add_argument("--any", action="store_true", help="无命中时退化为按置信度取前 N 条")
     s.set_defaults(func=cmd_search)
