@@ -1,8 +1,8 @@
 {
-  "version": 1,
-  "score_version": 1,
-  "source": "logs/mcp-calls.jsonl 中 2026-10-30 的真实 search 查询（28 次调用，去重后 17 条）",
-  "labeling": "expect 只收能直接回答该问题的经验；相邻话题不算。候选来自当前检索 top5，存在选择偏差，后续应补入『检索完全没捞到』的漏检样本。",
+  "version": 2,
+  "score_version": 2,
+  "source": "logs/mcp-calls.jsonl 中 2026-10-30 的真实 search 查询（28 次调用，去重后 17 条）；2026-11-05 补 3 条带 repo 标注的作用域查询",
+  "labeling": "expect 只收能直接回答该问题的经验；相邻话题不算。候选来自当前检索 top5，存在选择偏差，后续应补入『检索完全没捞到』的漏检样本。带 repo 的用例只用于测跨库隔离，expect 必须全部来自该仓库。",
   "queries": [
     {
       "query": "ai-radar 事件时间 回声 降级 主线",
@@ -65,6 +65,24 @@
       "query": "冷却 场景 state_revision 覆盖",
       "expect": ["a-755bb8f61676", "a-2d3dbb971ebc"],
       "note": "冷却写入不递增 state_revision 导致覆盖"
+    },
+    {
+      "query": "PowerShell 中文 BOM 语法错误",
+      "repo": "E:\\Desktop\\Recurrence",
+      "expect": ["a-338524934c0d"],
+      "note": "作用域查询：只能返回 Recurrence 工作区自己的经验"
+    },
+    {
+      "query": "事件时间 材料 回声",
+      "repo": "E:\\Desktop\\Recurrence\\_projects\\ai-radar",
+      "expect": ["a-ed312bdb9f19", "a-0f3e30b3994b"],
+      "note": "作用域查询：ai-radar 的事件时间与回声判定"
+    },
+    {
+      "query": "租约 幂等 续租",
+      "repo": "E:\\Desktop\\match",
+      "expect": ["a-7db35e6390c5", "a-28d621e1d3bf", "a-35ab753961b9", "a-b994b2b48356"],
+      "note": "作用域查询：match 仓库的四类租约失效路径"
     },
     {
       "query": "对侧 忽略 暂停 ignore_paused",
